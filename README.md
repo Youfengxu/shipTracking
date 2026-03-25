@@ -27,7 +27,7 @@ Open `.env` and fill in every value:
 | `ZONE_RADIUS_KM` | How close the ship needs to get to trigger an alert |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | https://pushover.net — create a free app |
 | `TG_TOKEN` | Message @BotFather on Telegram → /newbot |
-| `TG_CHAT_ID` | Message your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+| `TG_CHAT_ID` | See Telegram Group Setup section below |
 | `WEBHOOK_URL` | Your own endpoint, or leave blank to skip |
 
 ### 3. Test it manually first
@@ -72,6 +72,40 @@ pm2 stop ship-tracker        # stop
 pm2 startup      # follow the instruction it prints
 pm2 save         # save current process list
 ```
+
+---
+
+## Telegram Group Setup
+
+Alerts are sent to a Telegram group so multiple people can receive them.
+
+**Step 1 — Create a bot**
+- Open Telegram and search for `@BotFather`
+- Send `/newbot`, follow the prompts
+- Copy the token it gives you → `TG_TOKEN` in `.env`
+
+**Step 2 — Create a group and add your bot**
+- Create a new Telegram group (e.g. "Ship Alerts")
+- Add your bot as a member
+- Send any message in the group
+
+**Step 3 — Get the group chat ID**
+- Visit this URL in your browser (swap in your token):
+  ```
+  https://api.telegram.org/bot<TG_TOKEN>/getUpdates
+  ```
+- Find your group in the JSON — it will have `"type": "group"` and a **negative** ID:
+  ```json
+  "chat": { "id": -987654321, "type": "group" }
+  ```
+- Copy that negative number → `TG_CHAT_ID` in `.env`
+
+**Step 4 — Invite people**
+Anyone you add to the group will receive ship alerts automatically.
+
+> ⚠️ **Supergroup gotcha**: If Telegram automatically upgrades your group to a supergroup
+> (happens when you enable certain features), the chat ID format changes to `-100987654321`.
+> If alerts stop arriving, re-run `getUpdates` to get the updated ID and restart the tracker.
 
 ---
 
