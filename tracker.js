@@ -12,7 +12,6 @@ const TG_CHAT_ID       = process.env.TG_CHAT_ID;
 const SHIPS_FILE       = path.join(__dirname, 'ships.json');
 const POLL_INTERVAL    = 2500;  // ms — Telegram command polling frequency
 const AIS_CHECK_WINDOW = 30000; // ms — wait before "AIS still off" message
-const CONFIRM_TIMEOUT  = 60000; // ms — /confirm window before pending add expires
 
 // ── Ships state ───────────────────────────────────────────────────────────────
 
@@ -48,15 +47,9 @@ function buildBoundingBoxes() {
 
 // ── Runtime state ─────────────────────────────────────────────────────────────
 
-const insideZone = new Set();  // "mmsi::zoneLabel"
-const seenMmsis  = new Set();  // MMSIs heard since startup
-
-// Pending AIS-off follow-up timers: mmsi → { timer, chatId }
-const pendingAisChecks = new Map();
-
-// Pending /confirm entries: chatId → { ship, timer }
-// Only one pending confirmation per chat at a time.
-const pendingConfirms = new Map();
+const insideZone       = new Set(); // "mmsi::zoneLabel"
+const seenMmsis        = new Set(); // MMSIs heard since startup
+const pendingAisChecks = new Map(); // mmsi → { timer, chatId }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -266,17 +259,14 @@ function parseAddShip(args) {
   let zone      = null;
   let zoneStart = -1;
 
-  // Scan for 3 consecutive numeric tokens → lat, lon, radius
   for (let i = 1; i < tokens.length - 1; i++) {
     const mayLat    = parseFloat(tokens[i]);
     const mayLon    = parseFloat(tokens[i + 1]);
     const mayRadius = tokens[i + 2] !== undefined ? parseFloat(tokens[i + 2]) : NaN;
 
     if (!isNaN(mayLat) && !isNaN(mayLon) && !isNaN(mayRadius)) {
-      // Validate zone values
       const zoneErr = validateZone(mayLat, mayLon, mayRadius);
       if (zoneErr) return { error: zoneErr };
-
       zoneStart = i;
       const zoneLabel = tokens.slice(i + 3).join(' ') || 'Zone';
       zone = { label: zoneLabel, lat: mayLat, lon: mayLon, radiusKm: mayRadius };
@@ -290,93 +280,10 @@ function parseAddShip(args) {
   return { mmsi, name, zone };
 }
 
-// ── Pending confirmation helpers ──────────────────────────────────────────────
-
-function clearPendingConfirm(chatId) {
-  const entry = pendingConfirms.get(chatId);
-  if (entry) {
-    clearTimeout(entry.timer);
-    pendingConfirms.delete(chatId);
-  }
-}
-
-function setPendingConfirm(chatId, ship) {
-  clearPendingConfirm(chatId); // replace any existing pending confirm
-  const timer = setTimeout(async () => {
-    pendingConfirms.delete(chatId);
-    const label = ship.name || `MMSI ${ship.mmsi}`;
-    await replyTelegram(chatId,
-      `⏰ Confirmation timed out for ${label}.\nSend /addship again to retry.`
-    );
-    log(`Confirm timeout for MMSI ${ship.mmsi}`);
-  }, CONFIRM_TIMEOUT);
-  pendingConfirms.set(chatId, { ship, timer });
-}
-
-function formatShipSummary(ship) {
-  const nameStr = ship.name ? `🚢 Name:    ${ship.name}` : `🚢 Name:    (none)`;
-  const mmsiStr = `📟 MMSI:    ${ship.mmsi}`;
-  const zoneStr = ship.zone
-    ? `📍 Zone:    ${ship.zone.label}\n` +
-      `   Lat:     ${ship.zone.lat}\n` +
-      `   Lon:     ${ship.zone.lon}\n` +
-      `   Radius:  ${ship.zone.radiusKm} km`
-    : `📍 Zone:    None (AIS-on alert only)`;
-  return `${nameStr}\n${mmsiStr}\n${zoneStr}`;
-}
-
 // ── Command handler ───────────────────────────────────────────────────────────
 
 async function handleCommand(text, chatId) {
   const trimmed = text.trim();
-
-  // ── /confirm ────────────────────────────────────────────────────────────────
-  if (trimmed === '/confirm' || trimmed.startsWith('/confirm ')) {
-    const pending = pendingConfirms.get(chatId);
-    if (!pending) {
-      await replyTelegram(chatId, '❓ Nothing pending confirmation. Use /addship first.');
-      return;
-    }
-    clearPendingConfirm(chatId);
-    const { ship } = pending;
-    const mmsi = String(ship.mmsi);
-
-    if (SHIP_MAP[mmsi]) {
-      await replyTelegram(chatId, `⚠️ MMSI ${mmsi} is already being tracked. Use /removeship ${mmsi} first.`);
-      return;
-    }
-
-    SHIPS.push(ship);
-    SHIP_MAP[mmsi] = ship;
-    saveShips();
-    reconnectWebSocket();
-
-    const nameStr = ship.name || '(unnamed)';
-    const zoneStr = ship.zone
-      ? `\n📍 Zone: ${ship.zone.label} (${ship.zone.lat}, ${ship.zone.lon}) radius ${ship.zone.radiusKm} km`
-      : '\n📍 No zone — AIS-on alert only';
-    const secs = AIS_CHECK_WINDOW / 1000;
-
-    await replyTelegram(chatId,
-      `✅ Added ${nameStr} (MMSI ${mmsi})${zoneStr}\n` +
-      `⏳ Checking for AIS signal — will confirm within ${secs}s...`
-    );
-    scheduleAisCheck(mmsi, chatId);
-    log(`Confirmed and added ship: ${mmsi}`);
-    return;
-  }
-
-  // ── /cancel ─────────────────────────────────────────────────────────────────
-  if (trimmed === '/cancel' || trimmed.startsWith('/cancel ')) {
-    if (!pendingConfirms.has(chatId)) {
-      await replyTelegram(chatId, '❓ Nothing pending to cancel.');
-      return;
-    }
-    const { ship } = pendingConfirms.get(chatId);
-    clearPendingConfirm(chatId);
-    await replyTelegram(chatId, `🚫 Cancelled — ${ship.name || `MMSI ${ship.mmsi}`} was not added.`);
-    return;
-  }
 
   // ── /listships ──────────────────────────────────────────────────────────────
   if (trimmed === '/listships' || trimmed.startsWith('/listships ')) {
@@ -431,9 +338,9 @@ async function handleCommand(text, chatId) {
       await replyTelegram(chatId,
         '❌ Usage:\n' +
         '/addship <mmsi>\n' +
-        '/addship <mmsi> <name>\n' +
-        '/addship <mmsi> <name> <lat> <lon> <radiusKm>\n' +
-        '/addship <mmsi> <name> <lat> <lon> <radiusKm> <zoneLabel>\n\n' +
+        '/addship <mmsi> <n>\n' +
+        '/addship <mmsi> <n> <lat> <lon> <radiusKm>\n' +
+        '/addship <mmsi> <n> <lat> <lon> <radiusKm> <zoneLabel>\n\n' +
         'Name and zone are optional.\n' +
         'MMSI must be exactly 9 digits.\n' +
         'Lat: -90 to 90 | Lon: -180 to 180 | Radius: > 0'
@@ -454,16 +361,24 @@ async function handleCommand(text, chatId) {
       return;
     }
 
-    // Build the ship object and ask for confirmation
     const ship = { mmsi, ...(name && { name }), ...(zone && { zone }) };
-    setPendingConfirm(chatId, ship);
+    SHIPS.push(ship);
+    SHIP_MAP[mmsi] = ship;
+    saveShips();
+    reconnectWebSocket();
 
-    const secs = CONFIRM_TIMEOUT / 1000;
+    const nameStr = name || '(unnamed)';
+    const zoneStr = zone
+      ? `\n📍 Zone: ${zone.label} (${zone.lat}, ${zone.lon}) radius ${zone.radiusKm} km`
+      : '\n📍 No zone — AIS-on alert only';
+    const secs = AIS_CHECK_WINDOW / 1000;
+
     await replyTelegram(chatId,
-      `📋 Please confirm:\n\n${formatShipSummary(ship)}\n\n` +
-      `Reply /confirm to add, or /cancel to abort.\n` +
-      `(Times out in ${secs}s)`
+      `✅ Added ${nameStr} (MMSI ${mmsi})${zoneStr}\n` +
+      `⏳ Checking for AIS signal — will confirm within ${secs}s...`
     );
+    scheduleAisCheck(mmsi, chatId);
+    log(`Added ship: ${mmsi} name=${name} zone=${JSON.stringify(zone)}`);
     return;
   }
 
@@ -471,8 +386,6 @@ async function handleCommand(text, chatId) {
   await replyTelegram(chatId,
     '🤖 Available commands:\n' +
     '/addship <mmsi> [name] [lat lon radiusKm [zoneLabel]]\n' +
-    '/confirm — confirm pending /addship\n' +
-    '/cancel  — cancel pending /addship\n' +
     '/removeship <mmsi>\n' +
     '/listships'
   );
