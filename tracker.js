@@ -3,26 +3,65 @@ const WebSocket = require('ws');
 const axios = require('axios');
 
 // ── Config ────────────────────────────────────────────────────────────────────
+//
+// Ships are defined in ships.json. Each entry looks like:
+//
+//   {
+//     "mmsi": "123456789",
+//     "name": "RSS Fearless",          // friendly label for notifications
+//     "zone": {
+//       "label": "Sembawang Naval Base",
+//       "lat": 1.4585,
+//       "lon": 103.8185,
+//       "radiusKm": 3
+//     }
+//   }
+//
+// A ship with no "zone" key will still trigger an AIS-on alert, but no
+// entry/exit zone alerts will fire for it.
 
 const AISSTREAM_KEY = process.env.AISSTREAM_KEY;
-const TARGET_MMSIS  = process.env.TARGET_MMSIS.split(',').map(m => m.trim());
 
-const ZONE = {
-  lat:      parseFloat(process.env.ZONE_LAT),
-  lon:      parseFloat(process.env.ZONE_LON),
-  radiusKm: parseFloat(process.env.ZONE_RADIUS_KM),
-};
+let SHIPS;
+try {
+  SHIPS = require('./ships.json');
+} catch {
+  console.error('ERROR: ships.json not found. Copy ships.example.json to ships.json and fill it in.');
+  process.exit(1);
+}
 
-// Bounding box: ± 1 degree around zone centre (aisstream pre-filter)
-// Actual precision is handled by the haversine check below
-const BBOX = [[
-  [ZONE.lat - 1, ZONE.lon - 1],
-  [ZONE.lat + 1, ZONE.lon + 1],
-]];
+if (!Array.isArray(SHIPS) || SHIPS.length === 0) {
+  console.error('ERROR: ships.json must be a non-empty array.');
+  process.exit(1);
+}
+
+const TARGET_MMSIS = SHIPS.map(s => String(s.mmsi));
+
+// Build a lookup map: mmsi → ship config
+const SHIP_MAP = {};
+for (const ship of SHIPS) {
+  SHIP_MAP[String(ship.mmsi)] = ship;
+}
+
+// Build bounding boxes — one per ship zone (aisstream deduplicates overlaps)
+// ±1 degree is the coarse pre-filter; haversine handles actual precision.
+const BBOX = SHIPS
+  .filter(s => s.zone)
+  .map(s => [
+    [s.zone.lat - 1, s.zone.lon - 1],
+    [s.zone.lat + 1, s.zone.lon + 1],
+  ]);
+
+// Fallback to global box if no zones defined
+const BOUNDING_BOXES = BBOX.length > 0 ? BBOX : [[[-90, -180], [90, 180]]];
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-const insideZone = new Set(); // MMSIs currently inside the zone
+// Key format: "mmsi::zoneLabel" — tracks which ships are inside which zones
+const insideZone = new Set();
+
+// Tracks which MMSIs have been seen since startup (for AIS-on detection)
+const seenMmsis = new Set();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -81,32 +120,53 @@ async function sendWebhook(payload) {
   }
 }
 
-async function notifyEntry(ship) {
+async function notifyAisOn(ship, pos) {
+  const label = ship.name || `MMSI ${ship.mmsi}`;
   const msg =
-    `🚢 ${ship.name || 'Unknown vessel'} (MMSI ${ship.mmsi}) ` +
-    `entered your zone\n` +
-    `📍 ${ship.lat.toFixed(4)}, ${ship.lon.toFixed(4)} — ` +
-    `${ship.distKm.toFixed(2)} km from centre\n` +
+    `📡 AIS TURNED ON\n` +
+    `🚢 ${label} (MMSI ${ship.mmsi})\n` +
+    `🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}\n` +
     `🕐 ${new Date().toUTCString()}`;
 
-  log(`ENTRY: ${msg}`);
+  log(`AIS ON [${label}]`);
   await Promise.allSettled([
     sendPushover(msg),
     sendTelegram(msg),
-    sendWebhook({ event: 'zone_entry', ...ship, timestamp: new Date().toISOString() }),
+    sendWebhook({ event: 'ais_on', mmsi: ship.mmsi, shipName: label, lat: pos.lat, lon: pos.lon, timestamp: new Date().toISOString() }),
   ]);
 }
 
-async function notifyExit(ship) {
+async function notifyEntry(ship, zone, pos) {
+  const label = ship.name || `MMSI ${ship.mmsi}`;
   const msg =
-    `📤 ${ship.name || 'Unknown vessel'} (MMSI ${ship.mmsi}) left your zone\n` +
+    `🟢 ZONE ENTRY\n` +
+    `🚢 ${label}\n` +
+    `📍 Entered: ${zone.label}\n` +
+    `🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)} — ${pos.distKm.toFixed(2)} km from centre\n` +
     `🕐 ${new Date().toUTCString()}`;
 
-  log(`EXIT: ${msg}`);
+  log(`ENTRY [${label}] → ${zone.label}`);
   await Promise.allSettled([
     sendPushover(msg),
     sendTelegram(msg),
-    sendWebhook({ event: 'zone_exit', ...ship, timestamp: new Date().toISOString() }),
+    sendWebhook({ event: 'zone_entry', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon, distKm: pos.distKm, timestamp: new Date().toISOString() }),
+  ]);
+}
+
+async function notifyExit(ship, zone, pos) {
+  const label = ship.name || `MMSI ${ship.mmsi}`;
+  const msg =
+    `🔴 ZONE EXIT / POSSIBLE DEPARTURE\n` +
+    `🚢 ${label}\n` +
+    `📍 Left: ${zone.label}\n` +
+    `🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}\n` +
+    `🕐 ${new Date().toUTCString()}`;
+
+  log(`EXIT [${label}] ← ${zone.label}`);
+  await Promise.allSettled([
+    sendPushover(msg),
+    sendTelegram(msg),
+    sendWebhook({ event: 'zone_exit', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon, timestamp: new Date().toISOString() }),
   ]);
 }
 
@@ -120,25 +180,44 @@ async function handleMessage(raw) {
     return;
   }
 
-  // aisstream wraps position data under MetaData
   const meta = msg.MetaData;
   if (!meta) return;
 
-  const mmsi    = String(meta.MMSI);
-  const lat     = meta.latitude;
-  const lon     = meta.longitude;
-  const name    = (meta.ShipName || '').trim();
-  const distKm  = haversineKm(ZONE.lat, ZONE.lon, lat, lon);
-  const inZone  = distKm <= ZONE.radiusKm;
+  const mmsi = String(meta.MMSI);
+  const lat  = meta.latitude;
+  const lon  = meta.longitude;
+  const ship = SHIP_MAP[mmsi];
+  if (!ship) return;
 
-  log(`${name || mmsi} — ${distKm.toFixed(2)} km from zone centre`);
+  const displayName = ship.name || mmsi;
 
-  if (inZone && !insideZone.has(mmsi)) {
-    insideZone.add(mmsi);
-    await notifyEntry({ mmsi, name, lat, lon, distKm });
-  } else if (!inZone && insideZone.has(mmsi)) {
-    insideZone.delete(mmsi);
-    await notifyExit({ mmsi, name, lat, lon, distKm });
+  // ── AIS-on detection ──────────────────────────────────────────────────────
+  // First position report since tracker started = AIS just switched on
+  // Note: also fires on tracker restart — see README
+  if (!seenMmsis.has(mmsi)) {
+    seenMmsis.add(mmsi);
+    await notifyAisOn(ship, { lat, lon });
+  }
+
+  // ── Zone check ────────────────────────────────────────────────────────────
+  if (!ship.zone) {
+    log(`${displayName} — ${lat.toFixed(4)}, ${lon.toFixed(4)} (no zone configured)`);
+    return;
+  }
+
+  const zone     = ship.zone;
+  const distKm   = haversineKm(zone.lat, zone.lon, lat, lon);
+  const inZone   = distKm <= zone.radiusKm;
+  const stateKey = `${mmsi}::${zone.label}`;
+
+  log(`${displayName} — ${distKm.toFixed(2)} km from "${zone.label}" (radius ${zone.radiusKm} km)`);
+
+  if (inZone && !insideZone.has(stateKey)) {
+    insideZone.add(stateKey);
+    await notifyEntry(ship, zone, { lat, lon, distKm });
+  } else if (!inZone && insideZone.has(stateKey)) {
+    insideZone.delete(stateKey);
+    await notifyExit(ship, zone, { lat, lon, distKm });
   }
 }
 
@@ -147,17 +226,21 @@ async function handleMessage(raw) {
 let reconnectDelay = 5000;
 
 function connect() {
-  log(`Connecting to aisstream.io — tracking MMSIs: ${TARGET_MMSIS.join(', ')}`);
-  log(`Zone: ${ZONE.lat}, ${ZONE.lon} — radius ${ZONE.radiusKm} km`);
+  log(`Connecting to aisstream.io`);
+  log(`Tracking ${SHIPS.length} ship(s):`);
+  SHIPS.forEach(s => {
+    if (s.zone) log(`  ${s.name || s.mmsi} (${s.mmsi}) → zone "${s.zone.label}" radius ${s.zone.radiusKm} km`);
+    else        log(`  ${s.name || s.mmsi} (${s.mmsi}) → AIS-on alert only (no zone)`);
+  });
 
   const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
 
   ws.on('open', () => {
-    reconnectDelay = 5000; // reset backoff on successful connect
+    reconnectDelay = 5000;
     log('Connected. Sending subscription...');
     ws.send(JSON.stringify({
       APIKey:             AISSTREAM_KEY,
-      BoundingBoxes:      BBOX,
+      BoundingBoxes:      BOUNDING_BOXES,
       FiltersShipMMSI:    TARGET_MMSIS,
       FilterMessageTypes: ['PositionReport'],
     }));
@@ -168,12 +251,11 @@ function connect() {
   ws.on('close', (code, reason) => {
     log(`Disconnected (${code}: ${reason}). Reconnecting in ${reconnectDelay / 1000}s...`);
     setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 60000); // exponential backoff, max 60s
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
   });
 
   ws.on('error', (err) => {
     log(`WebSocket error: ${err.message}`);
-    // 'close' event will fire after this and handle reconnect
   });
 }
 

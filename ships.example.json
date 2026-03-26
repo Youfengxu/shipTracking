@@ -1,0 +1,22 @@
+[
+  {
+    "mmsi": "123456789",
+    "name": "RSS Fearless",
+    "zone": {
+      "label": "Sembawang Naval Base",
+      "lat": 1.4585,
+      "lon": 103.8185,
+      "radiusKm": 3
+    }
+  },
+  {
+    "mmsi": "987654321",
+    "name": "RSS Intrepid",
+    "zone": {
+      "label": "Sembawang Naval Base",
+      "lat": 1.4585,
+      "lon": 103.8185,
+      "radiusKm": 3
+    }
+  }
+]
