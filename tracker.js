@@ -6,16 +6,17 @@ const path = require('path');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const AISSTREAM_KEY  = process.env.AISSTREAM_KEY;
-const TG_TOKEN       = process.env.TG_TOKEN;
-const TG_CHAT_ID     = process.env.TG_CHAT_ID;
-const SHIPS_FILE     = path.join(__dirname, 'ships.json');
-const POLL_INTERVAL  = 2500; // ms — how often to check Telegram for commands
+const AISSTREAM_KEY      = process.env.AISSTREAM_KEY;
+const TG_TOKEN           = process.env.TG_TOKEN;
+const TG_CHAT_ID         = process.env.TG_CHAT_ID;
+const SHIPS_FILE         = path.join(__dirname, 'ships.json');
+const POLL_INTERVAL      = 2500;  // ms — Telegram command polling frequency
+const AIS_CHECK_WINDOW   = 30000; // ms — how long to wait before "AIS still off" message
 
-// ── Ships state (mutable — updated by /addship and /removeship) ───────────────
+// ── Ships state ───────────────────────────────────────────────────────────────
 
-let SHIPS    = [];   // array of ship objects
-let SHIP_MAP = {};   // mmsi string → ship object
+let SHIPS    = [];
+let SHIP_MAP = {};
 
 function loadShips() {
   try {
@@ -48,6 +49,10 @@ function buildBoundingBoxes() {
 
 const insideZone = new Set();  // "mmsi::zoneLabel"
 const seenMmsis  = new Set();  // MMSIs heard since startup
+
+// Pending AIS-check timers: mmsi → { timer, chatId }
+// Set when a ship is added via /addship, cleared when first AIS signal arrives.
+const pendingAisChecks = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,6 +117,18 @@ async function notify(text, payload) {
   ]);
 }
 
+async function replyTelegram(chatId, text) {
+  if (!TG_TOKEN) return;
+  try {
+    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      chat_id: chatId,
+      text,
+    });
+  } catch (err) {
+    log(`Telegram reply error: ${err.message}`);
+  }
+}
+
 // ── AIS event notifications ───────────────────────────────────────────────────
 
 async function notifyAisOn(ship, pos) {
@@ -138,6 +155,43 @@ async function notifyExit(ship, zone, pos) {
   );
 }
 
+// ── AIS-off follow-up ─────────────────────────────────────────────────────────
+//
+// When a ship is added via /addship, we start a timer. If no AIS signal
+// arrives within AIS_CHECK_WINDOW ms, we send a follow-up to the group
+// letting everyone know the ship is currently silent.
+
+function scheduleAisCheck(mmsi, chatId) {
+  // Clear any existing timer for this MMSI (e.g. re-added after removal)
+  clearPendingAisCheck(mmsi);
+
+  const timer = setTimeout(async () => {
+    pendingAisChecks.delete(mmsi);
+    const ship  = SHIP_MAP[mmsi];
+    if (!ship) return; // ship was removed before the timer fired
+    const label = ship.name || `MMSI ${mmsi}`;
+    const secs  = AIS_CHECK_WINDOW / 1000;
+    const msg   =
+      `⚠️ NO AIS SIGNAL DETECTED\n` +
+      `🚢 ${label} (MMSI ${mmsi})\n` +
+      `📵 No position report received in the last ${secs}s.\n` +
+      `   AIS may be off or out of terrestrial coverage.\n` +
+      `   You will be alerted automatically when it comes online.`;
+    log(`AIS check timeout for ${label} — sending no-signal notice`);
+    await replyTelegram(chatId, msg);
+  }, AIS_CHECK_WINDOW);
+
+  pendingAisChecks.set(mmsi, { timer, chatId });
+}
+
+function clearPendingAisCheck(mmsi) {
+  const entry = pendingAisChecks.get(mmsi);
+  if (entry) {
+    clearTimeout(entry.timer);
+    pendingAisChecks.delete(mmsi);
+  }
+}
+
 // ── AIS message handler ───────────────────────────────────────────────────────
 
 async function handleAisMessage(raw) {
@@ -155,9 +209,13 @@ async function handleAisMessage(raw) {
 
   const displayName = ship.name || mmsi;
 
-  // AIS-on detection
+  // AIS-on detection — fires on first signal since startup or since /addship
   if (!seenMmsis.has(mmsi)) {
     seenMmsis.add(mmsi);
+
+    // Cancel the "AIS still off" follow-up timer — signal arrived in time
+    clearPendingAisCheck(mmsi);
+
     await notifyAisOn(ship, { lat, lon });
   }
 
@@ -184,31 +242,14 @@ async function handleAisMessage(raw) {
 }
 
 // ── Telegram bot commands ─────────────────────────────────────────────────────
-//
-// /addship <mmsi> [name] [lat lon radiusKm [zoneLabel]]
-//
-//   Examples:
-//     /addship 123456789
-//     /addship 123456789 RSS Fearless
-//     /addship 123456789 RSS Fearless 1.4585 103.8185 3
-//     /addship 123456789 RSS Fearless 1.4585 103.8185 3 Sembawang Naval Base
-//
-// /removeship <mmsi>
-// /listships
 
 function parseAddShip(args) {
-  // args is a string after "/addship "
-  // mmsi is always first token
   const tokens = args.trim().split(/\s+/);
   if (tokens.length < 1) return null;
 
   const mmsi = tokens[0];
   if (!/^\d{7,10}$/.test(mmsi)) return { error: `Invalid MMSI: "${mmsi}". Must be 7–10 digits.` };
 
-  // Try to detect where the optional zone params start.
-  // Zone params are always: lat lon radiusKm [zoneLabel...]
-  // lat and lon are floats, so we scan from the end backwards looking for
-  // 3 consecutive numeric tokens to identify the zone block.
   let name      = null;
   let zone      = null;
   let zoneStart = -1;
@@ -226,7 +267,6 @@ function parseAddShip(args) {
     }
   }
 
-  // Name is everything between mmsi and the zone block (or end of tokens)
   const nameEnd = zoneStart > -1 ? zoneStart : tokens.length;
   name = tokens.slice(1, nameEnd).join(' ') || null;
 
@@ -243,11 +283,12 @@ async function handleCommand(text, chatId) {
       return;
     }
     const lines = SHIPS.map(s => {
-      const name = s.name || '(unnamed)';
-      const zone = s.zone
+      const name   = s.name || '(unnamed)';
+      const zone   = s.zone
         ? `\n   📍 ${s.zone.label} (${s.zone.lat}, ${s.zone.lon}) r=${s.zone.radiusKm} km`
         : '\n   📍 No zone';
-      return `• ${name} — MMSI ${s.mmsi}${zone}`;
+      const status = seenMmsis.has(String(s.mmsi)) ? ' 🟢 AIS on' : ' 📵 AIS off';
+      return `• ${name} — MMSI ${s.mmsi}${status}${zone}`;
     });
     await replyTelegram(chatId, `📋 Tracked ships (${SHIPS.length}):\n\n${lines.join('\n\n')}`);
     return;
@@ -268,6 +309,7 @@ async function handleCommand(text, chatId) {
     const removed = SHIPS.splice(idx, 1)[0];
     delete SHIP_MAP[String(mmsi)];
     seenMmsis.delete(String(mmsi));
+    clearPendingAisCheck(String(mmsi));
     saveShips();
     reconnectWebSocket();
     await replyTelegram(chatId, `✅ Removed ${removed.name || mmsi} (MMSI ${mmsi}) from tracking.`);
@@ -298,7 +340,7 @@ async function handleCommand(text, chatId) {
     const { mmsi, name, zone } = parsed;
 
     if (SHIP_MAP[mmsi]) {
-      await replyTelegram(chatId, `⚠️ MMSI ${mmsi} is already being tracked. Remove it first with /removeship ${mmsi}`);
+      await replyTelegram(chatId, `⚠️ MMSI ${mmsi} is already being tracked. Use /removeship ${mmsi} first.`);
       return;
     }
 
@@ -312,7 +354,19 @@ async function handleCommand(text, chatId) {
     const zoneStr = zone
       ? `\n📍 Zone: ${zone.label} (${zone.lat}, ${zone.lon}) radius ${zone.radiusKm} km`
       : '\n📍 No zone — AIS-on alert only';
-    await replyTelegram(chatId, `✅ Added ${nameStr} (MMSI ${mmsi})\n${zoneStr}\n⚡ Tracking active immediately.`);
+    const secs = AIS_CHECK_WINDOW / 1000;
+
+    // Confirmation message
+    await replyTelegram(chatId,
+      `✅ Added ${nameStr} (MMSI ${mmsi})${zoneStr}\n` +
+      `⏳ Checking for AIS signal — will confirm within ${secs}s...`
+    );
+
+    // Start the AIS-off follow-up timer
+    // If AIS signal arrives within the window, the timer is cancelled in handleAisMessage
+    // and the normal AIS-on alert fires instead.
+    scheduleAisCheck(mmsi, chatId);
+
     log(`Added ship: ${mmsi} name=${name} zone=${JSON.stringify(zone)}`);
     return;
   }
@@ -321,17 +375,6 @@ async function handleCommand(text, chatId) {
   await replyTelegram(chatId,
     '🤖 Available commands:\n/addship <mmsi> [name] [lat lon radiusKm [zoneLabel]]\n/removeship <mmsi>\n/listships'
   );
-}
-
-async function replyTelegram(chatId, text) {
-  try {
-    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      chat_id: chatId,
-      text,
-    });
-  } catch (err) {
-    log(`Telegram reply error: ${err.message}`);
-  }
 }
 
 // ── Telegram polling loop ─────────────────────────────────────────────────────
@@ -363,7 +406,7 @@ async function pollTelegram() {
 
 // ── WebSocket connection ──────────────────────────────────────────────────────
 
-let ws            = null;
+let ws             = null;
 let reconnectDelay = 5000;
 
 function connect() {
@@ -398,8 +441,6 @@ function connect() {
 }
 
 function reconnectWebSocket() {
-  // Called after ship list changes — close current connection to re-subscribe
-  // with updated MMSI list and bounding boxes. The close handler will reconnect.
   log('Ship list changed — reconnecting WebSocket with updated subscription...');
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     ws.close();
