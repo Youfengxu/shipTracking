@@ -8,6 +8,8 @@ an optional **webhook** for three events:
 - 🟢 **Zone entry** — ship crosses into its defined radius
 - 🔴 **Zone exit / departure** — ship crosses back out
 
+Ships can be managed live via **Telegram commands** — no restart needed.
+
 ---
 
 ## Setup
@@ -27,7 +29,7 @@ Copy the example file and edit it:
 cp ships.example.json ships.json
 ```
 
-Edit `ships.json` — one entry per ship:
+Edit `ships.json` — one entry per ship. All fields except `mmsi` are optional:
 
 ```json
 [
@@ -42,27 +44,19 @@ Edit `ships.json` — one entry per ship:
     }
   },
   {
-    "mmsi": "987654321",
-    "name": "RSS Intrepid",
-    "zone": {
-      "label": "Changi Naval Base",
-      "lat": 1.3644,
-      "lon": 104.0109,
-      "radiusKm": 2
-    }
+    "mmsi": "987654321"
   }
 ]
 ```
 
-Each ship can have a **different zone** (different location and radius), or the same zone.
-Remove the `"zone"` key entirely if you only want AIS-on alerts for a ship with no geofence.
+- Omit `"name"` → notifications show MMSI instead
+- Omit `"zone"` → only AIS-on alerts fire, no geofence
+- Each ship can have a **different zone** (different location and radius)
 
-> 💡 Find MMSI numbers in the MarineTraffic app: tap a ship → Details → MMSI
+> 💡 Find MMSIs in the MarineTraffic app: tap a ship → Details → MMSI
 > 💡 Get coordinates by long-pressing a location in Google Maps
 
 ### 3. Fill in your .env
-
-Open `.env` and fill in:
 
 | Variable | Where to get it |
 |---|---|
@@ -78,13 +72,56 @@ Open `.env` and fill in:
 node tracker.js
 ```
 
-You should see startup logs listing each ship and its zone:
+Startup logs will list each ship and its zone:
 ```
 [...] Tracking 2 ship(s):
-[...]   RSS Fearless (123456789) → zone "Sembawang Naval Base" radius 3 km
-[...]   RSS Intrepid (987654321) → zone "Changi Naval Base" radius 2 km
+[...]   RSS Fearless (123456789) → "Sembawang Naval Base" r=3 km
+[...]   987654321 (987654321) → AIS-on only
 [...] Connected. Sending subscription...
 ```
+
+---
+
+## Telegram commands
+
+You can manage ships live by sending commands to your Telegram group.
+The bot polls for commands every **2.5 seconds**.
+
+### /addship
+
+```
+/addship <mmsi>
+/addship <mmsi> <name>
+/addship <mmsi> <name> <lat> <lon> <radiusKm>
+/addship <mmsi> <name> <lat> <lon> <radiusKm> <zoneLabel>
+```
+
+All arguments after the MMSI are optional:
+
+| Example | Effect |
+|---|---|
+| `/addship 123456789` | Track by MMSI only, no name, no zone |
+| `/addship 123456789 RSS Fearless` | Add with friendly name, no zone |
+| `/addship 123456789 RSS Fearless 1.4585 103.8185 3` | Add with name and zone (label defaults to "Zone") |
+| `/addship 123456789 RSS Fearless 1.4585 103.8185 3 Sembawang Naval Base` | Full config |
+
+The new ship is tracked **immediately** — no restart needed.
+
+### /removeship
+
+```
+/removeship <mmsi>
+```
+
+Removes the ship from tracking immediately.
+
+### /listships
+
+```
+/listships
+```
+
+Shows all currently tracked ships with their zones.
 
 ---
 
@@ -93,7 +130,6 @@ You should see startup logs listing each ship and its zone:
 ### Start
 
 ```bash
-# Update the cwd path in ecosystem.config.js first, then:
 mkdir -p logs
 pm2 start ecosystem.config.js
 ```
@@ -104,7 +140,7 @@ pm2 start ecosystem.config.js
 pm2 status                          # see if it's running
 pm2 logs ship-tracker               # live log tail
 pm2 logs ship-tracker --lines 100   # last 100 lines
-pm2 restart ship-tracker            # restart after ships.json or .env changes
+pm2 restart ship-tracker            # restart (only needed after .env changes)
 pm2 stop ship-tracker               # stop
 ```
 
@@ -119,12 +155,10 @@ pm2 save         # save current process list
 
 ## Telegram Group Setup
 
-Alerts are sent to a Telegram group so multiple people can receive them.
-
 **Step 1 — Create a bot**
 - Open Telegram and search for `@BotFather`
 - Send `/newbot`, follow the prompts
-- Copy the token it gives you → `TG_TOKEN` in `.env`
+- Copy the token → `TG_TOKEN` in `.env`
 
 **Step 2 — Create a group and add your bot**
 - Create a new Telegram group (e.g. "Ship Alerts")
@@ -132,46 +166,41 @@ Alerts are sent to a Telegram group so multiple people can receive them.
 - Send any message in the group
 
 **Step 3 — Get the group chat ID**
-- Visit this URL in your browser (swap in your token):
-  ```
-  https://api.telegram.org/bot<TG_TOKEN>/getUpdates
-  ```
-- Find your group in the JSON — it will have `"type": "group"` and a **negative** ID:
-  ```json
-  "chat": { "id": -987654321, "type": "group" }
-  ```
-- Copy that negative number → `TG_CHAT_ID` in `.env`
+- Visit: `https://api.telegram.org/bot<TG_TOKEN>/getUpdates`
+- Find `"type": "group"` in the JSON — copy the negative `"id"` value
+- Paste it as `TG_CHAT_ID` in `.env`
 
 **Step 4 — Invite people**
-Anyone you add to the group will receive ship alerts automatically.
+Anyone in the group receives alerts. Anyone can also send bot commands.
 
-> ⚠️ **Supergroup gotcha**: If Telegram automatically upgrades your group to a supergroup,
-> the chat ID changes to `-100987654321`. If alerts stop arriving, re-run `getUpdates`
-> to get the updated ID and `pm2 restart ship-tracker`.
+> ⚠️ **Supergroup gotcha**: If Telegram upgrades your group to a supergroup,
+> the chat ID changes to `-100XXXXXXXXX`. Re-run `getUpdates` to get the new ID
+> and update `.env`, then `pm2 restart ship-tracker`.
 
 ---
 
 ## How it works
 
-1. Loads ship config from `ships.json` — each ship has its own zone.
-2. Connects to `aisstream.io` via WebSocket, filtered to your MMSIs and bounding boxes.
-3. On the **first position report** for a ship since startup → fires AIS-on alert.
-4. On each subsequent report → checks if the ship is inside its zone radius (haversine distance).
-5. **Zone entry**: fires when ship crosses into radius for the first time.
-6. **Zone exit**: fires when ship moves back outside — signals a departure.
-7. Auto-reconnects with exponential backoff if the connection drops.
+1. Loads `ships.json` on startup.
+2. Connects to `aisstream.io` via persistent WebSocket, filtered to tracked MMSIs.
+3. **First position report** for any ship → fires AIS-on alert.
+4. Each subsequent report → haversine distance check against that ship's zone.
+5. **Zone entry / exit** → fires alert on transition.
+6. **Telegram polling** runs every 2.5s in parallel — processes `/addship`, `/removeship`,
+   `/listships` commands. On add/remove, `ships.json` is updated and the WebSocket
+   reconnects with the new subscription immediately.
+7. Auto-reconnects with exponential backoff on disconnect.
 
-> ⚠️ **AIS-on alert on restart**: Because the tracker has no persistent state, restarting
-> it will re-fire the AIS-on alert for any ship already broadcasting. This is expected.
+> ⚠️ **AIS-on alert on restart**: Restarting the tracker re-fires the AIS-on alert
+> for any ship already broadcasting. This is expected.
 
 ---
 
 ## Adding or changing ships
 
-Edit `ships.json` and restart:
+Preferred: use `/addship` or `/removeship` in Telegram — live, no restart.
 
+Alternatively, edit `ships.json` directly and run:
 ```bash
 pm2 restart ship-tracker
 ```
-
-No code changes needed.
