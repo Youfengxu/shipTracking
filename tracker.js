@@ -92,7 +92,8 @@ async function sendTelegram(text) {
       { chat_id: TG_CHAT_ID, text }
     );
   } catch (err) {
-    log(`Telegram error: ${err.message}`);
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    log(`Telegram error: ${detail}`);
   }
 }
 
@@ -469,5 +470,6 @@ if (!AISSTREAM_KEY || AISSTREAM_KEY === 'your_aisstream_api_key_here') {
 }
 
 loadShips();
+for (const ship of SHIPS) scheduleAisCheck(String(ship.mmsi), TG_CHAT_ID);
 connect();
 pollTelegram();
