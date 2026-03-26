@@ -10,6 +10,7 @@ const AISSTREAM_KEY    = process.env.AISSTREAM_KEY;
 const TG_TOKEN         = process.env.TG_TOKEN;
 const TG_CHAT_ID       = process.env.TG_CHAT_ID;
 const SHIPS_FILE       = path.join(__dirname, 'ships.json');
+const ZONES_FILE       = path.join(__dirname, 'zones.json');
 const POLL_INTERVAL    = 2500;  // ms — Telegram command polling frequency
 const AIS_CHECK_WINDOW = 30000; // ms — wait before "AIS still off" message
 
@@ -20,7 +21,14 @@ let SHIP_MAP = {};
 
 function loadShips() {
   try {
-    SHIPS    = JSON.parse(fs.readFileSync(SHIPS_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(SHIPS_FILE, 'utf8'));
+    SHIPS = raw.map(s => {
+      if (s.zone && !s.zones) {
+        const { zone, ...rest } = s;
+        return { ...rest, zones: [zone] };
+      }
+      return { zones: [], ...s };
+    });
     SHIP_MAP = {};
     for (const s of SHIPS) SHIP_MAP[String(s.mmsi)] = s;
     log(`Loaded ${SHIPS.length} ship(s) from ships.json`);
@@ -35,13 +43,39 @@ function saveShips() {
   fs.writeFileSync(SHIPS_FILE, JSON.stringify(SHIPS, null, 2));
 }
 
+// ── Zone registry ─────────────────────────────────────────────────────────────
+
+let ZONES = {}; // label → { label, lat, lon, radiusKm }
+
+function loadZones() {
+  try {
+    ZONES = JSON.parse(fs.readFileSync(ZONES_FILE, 'utf8'));
+    log(`Loaded ${Object.keys(ZONES).length} zone(s) from zones.json`);
+  } catch {
+    ZONES = {};
+  }
+}
+
+function saveZones() {
+  fs.writeFileSync(ZONES_FILE, JSON.stringify(ZONES, null, 2));
+}
+
+function resolveZoneLabel(label) {
+  const lower = label.toLowerCase();
+  const key = Object.keys(ZONES).find(k => k.toLowerCase() === lower);
+  return key ? ZONES[key] : null;
+}
+
 function buildBoundingBoxes() {
-  const boxes = SHIPS
-    .filter(s => s.zone)
-    .map(s => [
-      [s.zone.lat - 1, s.zone.lon - 1],
-      [s.zone.lat + 1, s.zone.lon + 1],
-    ]);
+  const boxes = [];
+  for (const s of SHIPS) {
+    for (const z of (s.zones || [])) {
+      boxes.push([
+        [z.lat - 1, z.lon - 1],
+        [z.lat + 1, z.lon + 1],
+      ]);
+    }
+  }
   return boxes.length > 0 ? boxes : [[[-90, -180], [90, 180]]];
 }
 
@@ -206,24 +240,26 @@ async function handleAisMessage(raw) {
     await notifyAisOn(ship, { lat, lon });
   }
 
-  if (!ship.zone) {
+  const zones = ship.zones || [];
+  if (zones.length === 0) {
     log(`${displayName} — ${lat.toFixed(4)}, ${lon.toFixed(4)} (no zone)`);
     return;
   }
 
-  const zone     = ship.zone;
-  const distKm   = haversineKm(zone.lat, zone.lon, lat, lon);
-  const inZone   = distKm <= zone.radiusKm;
-  const stateKey = `${mmsi}::${zone.label}`;
+  for (const zone of zones) {
+    const distKm   = haversineKm(zone.lat, zone.lon, lat, lon);
+    const inZone   = distKm <= zone.radiusKm;
+    const stateKey = `${mmsi}::${zone.label}`;
 
-  log(`${displayName} — ${distKm.toFixed(2)} km from "${zone.label}"`);
+    log(`${displayName} — ${distKm.toFixed(2)} km from "${zone.label}"`);
 
-  if (inZone && !insideZone.has(stateKey)) {
-    insideZone.add(stateKey);
-    await notifyEntry(ship, zone, { lat, lon, distKm });
-  } else if (!inZone && insideZone.has(stateKey)) {
-    insideZone.delete(stateKey);
-    await notifyExit(ship, zone, { lat, lon, distKm });
+    if (inZone && !insideZone.has(stateKey)) {
+      insideZone.add(stateKey);
+      await notifyEntry(ship, zone, { lat, lon, distKm });
+    } else if (!inZone && insideZone.has(stateKey)) {
+      insideZone.delete(stateKey);
+      await notifyExit(ship, zone, { lat, lon, distKm });
+    }
   }
 }
 
@@ -248,19 +284,8 @@ function validateZone(lat, lon, radiusKm) {
 
 // ── /addship parser ───────────────────────────────────────────────────────────
 
-function parseAddShip(args) {
-  const tokens = args.trim().split(/\s+/);
-  if (tokens.length < 1 || !tokens[0]) return { error: 'No MMSI provided.' };
-
-  const mmsi = tokens[0];
-  const mmsiErr = validateMmsi(mmsi);
-  if (mmsiErr) return { error: mmsiErr };
-
-  let name      = null;
-  let zone      = null;
-  let zoneStart = -1;
-
-  for (let i = 1; i < tokens.length - 1; i++) {
+function parseZoneFromTokens(tokens, startIdx) {
+  for (let i = startIdx; i < tokens.length - 1; i++) {
     const mayLat    = parseFloat(tokens[i]);
     const mayLon    = parseFloat(tokens[i + 1]);
     const mayRadius = tokens[i + 2] !== undefined ? parseFloat(tokens[i + 2]) : NaN;
@@ -268,17 +293,69 @@ function parseAddShip(args) {
     if (!isNaN(mayLat) && !isNaN(mayLon) && !isNaN(mayRadius)) {
       const zoneErr = validateZone(mayLat, mayLon, mayRadius);
       if (zoneErr) return { error: zoneErr };
-      zoneStart = i;
       const zoneLabel = tokens.slice(i + 3).join(' ') || 'Zone';
-      zone = { label: zoneLabel, lat: mayLat, lon: mayLon, radiusKm: mayRadius };
-      break;
+      return { zone: { label: zoneLabel, lat: mayLat, lon: mayLon, radiusKm: mayRadius }, zoneStart: i };
     }
   }
+  return { zone: null, zoneStart: -1 };
+}
 
-  const nameEnd = zoneStart > -1 ? zoneStart : tokens.length;
-  name = tokens.slice(1, nameEnd).join(' ') || null;
+function findZoneLabelSuffix(tokens) {
+  for (let len = tokens.length; len >= 1; len--) {
+    const candidate = tokens.slice(-len).join(' ');
+    const zone = resolveZoneLabel(candidate);
+    if (zone) return { zone, prefixLen: tokens.length - len };
+  }
+  return null;
+}
 
-  return { mmsi, name, zone };
+function parseAddShip(args) {
+  const tokens = args.trim().split(/\s+/);
+  if (tokens.length < 1 || !tokens[0]) return { error: 'No MMSI or ship name provided.' };
+
+  // MMSI-based: first token is exactly 9 digits
+  if (/^\d{9}$/.test(tokens[0])) {
+    const mmsi = tokens[0];
+    const rest = tokens.slice(1);
+
+    // Try coordinate triple first
+    const { zone, zoneStart, error } = parseZoneFromTokens(tokens, 1);
+    if (error) return { error };
+    if (zone) {
+      const name = tokens.slice(1, zoneStart).join(' ') || null;
+      return { mmsi, name, zone };
+    }
+
+    // Try registered zone label suffix
+    const match = findZoneLabelSuffix(rest);
+    if (match) {
+      const name = rest.slice(0, match.prefixLen).join(' ') || null;
+      return { mmsi, name, zone: match.zone };
+    }
+
+    // No zone
+    const name = rest.join(' ') || null;
+    return { mmsi, name, zone: null };
+  }
+
+  // Name-based: try coordinate triple first
+  const { zone, zoneStart, error } = parseZoneFromTokens(tokens, 0);
+  if (error) return { error };
+  if (zone) {
+    const shipName = tokens.slice(0, zoneStart).join(' ');
+    if (!shipName) return { error: 'No ship name provided.' };
+    return { byName: shipName, zone };
+  }
+
+  // Try registered zone label suffix
+  const match = findZoneLabelSuffix(tokens);
+  if (match) {
+    const shipName = tokens.slice(0, match.prefixLen).join(' ');
+    if (!shipName) return { error: 'No ship name provided.' };
+    return { byName: shipName, zone: match.zone };
+  }
+
+  return { error: 'No zone coordinates or known zone label found.\nUse /addzone to register a zone first, or provide coordinates: <lat> <lon> <radiusKm> [zoneLabel]' };
 }
 
 // ── Command handler ───────────────────────────────────────────────────────────
@@ -294,11 +371,11 @@ async function handleCommand(text, chatId) {
     }
     const lines = SHIPS.map(s => {
       const name   = s.name || '(unnamed)';
-      const zone   = s.zone
-        ? `\n   📍 ${s.zone.label} (${s.zone.lat}, ${s.zone.lon}) r=${s.zone.radiusKm} km`
-        : '\n   📍 No zone';
       const status = seenMmsis.has(String(s.mmsi)) ? ' 🟢 AIS on' : ' 📵 AIS off';
-      return `• ${name} — MMSI ${s.mmsi}${status}${zone}`;
+      const zones  = (s.zones || []).length > 0
+        ? (s.zones).map(z => `\n   📍 ${z.label} (${z.lat}, ${z.lon}) r=${z.radiusKm} km`).join('')
+        : '\n   📍 No zone';
+      return `• ${name} — MMSI ${s.mmsi}${status}${zones}`;
     });
     await replyTelegram(chatId, `📋 Tracked ships (${SHIPS.length}):\n\n${lines.join('\n\n')}`);
     return;
@@ -332,6 +409,34 @@ async function handleCommand(text, chatId) {
     return;
   }
 
+  // ── /addzone <lat> <lon> <radiusKm> <zoneLabel> ─────────────────────────────
+  if (trimmed.startsWith('/addzone')) {
+    const args = trimmed.slice('/addzone'.length).trim();
+    if (!args) {
+      await replyTelegram(chatId, '❌ Usage: /addzone <lat> <lon> <radiusKm> <zoneLabel>');
+      return;
+    }
+    const tokens = args.split(/\s+/);
+    if (tokens.length < 4) {
+      await replyTelegram(chatId, '❌ All arguments required: /addzone <lat> <lon> <radiusKm> <zoneLabel>');
+      return;
+    }
+    const lat      = parseFloat(tokens[0]);
+    const lon      = parseFloat(tokens[1]);
+    const radiusKm = parseFloat(tokens[2]);
+    const label    = tokens.slice(3).join(' ');
+    const zoneErr  = validateZone(lat, lon, radiusKm);
+    if (zoneErr) {
+      await replyTelegram(chatId, `❌ ${zoneErr}`);
+      return;
+    }
+    ZONES[label] = { label, lat, lon, radiusKm };
+    saveZones();
+    await replyTelegram(chatId, `✅ Zone "${label}" saved\n📍 (${lat}, ${lon}) radius ${radiusKm} km`);
+    log(`Added zone: ${label} (${lat}, ${lon}) r=${radiusKm} km`);
+    return;
+  }
+
   // ── /addship <mmsi> [name] [lat lon radiusKm [zoneLabel]] ───────────────────
   if (trimmed.startsWith('/addship')) {
     const args = trimmed.slice('/addship'.length).trim();
@@ -339,10 +444,13 @@ async function handleCommand(text, chatId) {
       await replyTelegram(chatId,
         '❌ Usage:\n' +
         '/addship <mmsi>\n' +
-        '/addship <mmsi> <n>\n' +
-        '/addship <mmsi> <n> <lat> <lon> <radiusKm>\n' +
-        '/addship <mmsi> <n> <lat> <lon> <radiusKm> <zoneLabel>\n\n' +
-        'Name and zone are optional.\n' +
+        '/addship <mmsi> <name>\n' +
+        '/addship <mmsi> <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
+        '/addship <mmsi> <name> <savedZoneLabel>\n\n' +
+        'To add a zone to an existing ship by name:\n' +
+        '/addship <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
+        '/addship <name> <savedZoneLabel>\n\n' +
+        'Register zones first with /addzone.\n' +
         'MMSI must be exactly 9 digits.\n' +
         'Lat: -90 to 90 | Lon: -180 to 180 | Radius: > 0'
       );
@@ -355,6 +463,26 @@ async function handleCommand(text, chatId) {
       return;
     }
 
+    // Name-based: add a zone to an existing ship
+    if (parsed.byName !== undefined) {
+      const nameLower = parsed.byName.toLowerCase();
+      const existing  = SHIPS.find(s => s.name && s.name.toLowerCase() === nameLower);
+      if (!existing) {
+        await replyTelegram(chatId, `❌ No ship named "${parsed.byName}" found. Use /listships to see tracked ships.`);
+        return;
+      }
+      existing.zones.push(parsed.zone);
+      saveShips();
+      reconnectWebSocket();
+      const z = parsed.zone;
+      await replyTelegram(chatId,
+        `✅ Added zone to ${existing.name} (MMSI ${existing.mmsi})\n` +
+        `📍 ${z.label} (${z.lat}, ${z.lon}) radius ${z.radiusKm} km`
+      );
+      log(`Added zone to ship ${existing.mmsi}: ${JSON.stringify(parsed.zone)}`);
+      return;
+    }
+
     const { mmsi, name, zone } = parsed;
 
     if (SHIP_MAP[mmsi]) {
@@ -362,7 +490,7 @@ async function handleCommand(text, chatId) {
       return;
     }
 
-    const ship = { mmsi, ...(name && { name }), ...(zone && { zone }) };
+    const ship = { mmsi, ...(name && { name }), zones: zone ? [zone] : [] };
     SHIPS.push(ship);
     SHIP_MAP[mmsi] = ship;
     saveShips();
@@ -379,14 +507,15 @@ async function handleCommand(text, chatId) {
       `⏳ Checking for AIS signal — will confirm within ${secs}s...`
     );
     scheduleAisCheck(mmsi, chatId);
-    log(`Added ship: ${mmsi} name=${name} zone=${JSON.stringify(zone)}`);
+    log(`Added ship: ${mmsi} name=${name} zones=${JSON.stringify(ship.zones)}`);
     return;
   }
 
   // ── Unknown command ──────────────────────────────────────────────────────────
   await replyTelegram(chatId,
     '🤖 Available commands:\n' +
-    '/addship <mmsi> [name] [lat lon radiusKm [zoneLabel]]\n' +
+    '/addzone <lat> <lon> <radiusKm> <zoneLabel>\n' +
+    '/addship <mmsi> [name] [zone]\n' +
     '/removeship <mmsi>\n' +
     '/listships'
   );
@@ -427,8 +556,9 @@ let reconnectDelay = 5000;
 function connect() {
   log(`Connecting to aisstream.io — tracking ${SHIPS.length} ship(s)`);
   SHIPS.forEach(s => {
-    if (s.zone) log(`  ${s.name || s.mmsi} (${s.mmsi}) → "${s.zone.label}" r=${s.zone.radiusKm} km`);
-    else        log(`  ${s.name || s.mmsi} (${s.mmsi}) → AIS-on only`);
+    const zones = s.zones || [];
+    if (zones.length > 0) zones.forEach(z => log(`  ${s.name || s.mmsi} (${s.mmsi}) → "${z.label}" r=${z.radiusKm} km`));
+    else                  log(`  ${s.name || s.mmsi} (${s.mmsi}) → AIS-on only`);
   });
 
   ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
@@ -469,6 +599,7 @@ if (!AISSTREAM_KEY || AISSTREAM_KEY === 'your_aisstream_api_key_here') {
   process.exit(1);
 }
 
+loadZones();
 loadShips();
 for (const ship of SHIPS) scheduleAisCheck(String(ship.mmsi), TG_CHAT_ID);
 connect();
