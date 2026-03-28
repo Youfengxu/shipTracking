@@ -511,14 +511,77 @@ async function handleCommand(text, chatId) {
     return;
   }
 
+  // ── /updatemmsi <name> <newMmsi> ────────────────────────────────────────────
+  if (trimmed.startsWith('/updatemmsi')) {
+    const tokens = trimmed.slice('/updatemmsi'.length).trim().split(/\s+/);
+    if (tokens.length < 2 || !tokens[0]) {
+      await replyTelegram(chatId, '❌ Usage: /updatemmsi <name> <newMmsi>');
+      return;
+    }
+    const newMmsi   = tokens[tokens.length - 1];
+    const shipName  = tokens.slice(0, -1).join(' ');
+    const mmsiErr   = validateMmsi(newMmsi);
+    if (mmsiErr) {
+      await replyTelegram(chatId, `❌ ${mmsiErr}`);
+      return;
+    }
+    const nameLower = shipName.toLowerCase();
+    const ship      = SHIPS.find(s => s.name && s.name.toLowerCase() === nameLower);
+    if (!ship) {
+      await replyTelegram(chatId, `❌ No ship named "${shipName}" found. Use /listships to see tracked ships.`);
+      return;
+    }
+    if (SHIP_MAP[newMmsi]) {
+      await replyTelegram(chatId, `⚠️ MMSI ${newMmsi} is already assigned to ${SHIP_MAP[newMmsi].name || newMmsi}.`);
+      return;
+    }
+    const oldMmsi = String(ship.mmsi);
+    // migrate runtime state keyed on old MMSI
+    clearPendingAisCheck(oldMmsi);
+    seenMmsis.delete(oldMmsi);
+    for (const key of insideZone) {
+      if (key.startsWith(oldMmsi + '::')) {
+        insideZone.delete(key);
+        insideZone.add(newMmsi + '::' + key.slice(oldMmsi.length + 2));
+      }
+    }
+    delete SHIP_MAP[oldMmsi];
+    ship.mmsi = newMmsi;
+    SHIP_MAP[newMmsi] = ship;
+    saveShips();
+    reconnectWebSocket();
+    await replyTelegram(chatId, `✅ ${ship.name}: MMSI updated ${oldMmsi} → ${newMmsi}`);
+    log(`Updated MMSI for ${ship.name}: ${oldMmsi} → ${newMmsi}`);
+    return;
+  }
+
+  // ── /help ────────────────────────────────────────────────────────────────────
+  if (trimmed === '/help' || trimmed.startsWith('/help ')) {
+    await replyTelegram(chatId,
+      '🤖 Commands:\n\n' +
+      '/addship <mmsi>\n' +
+      '/addship <mmsi> <name>\n' +
+      '/addship <mmsi> <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
+      '/addship <mmsi> <name> <savedZoneLabel>\n' +
+      '/addship <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
+      '/addship <name> <savedZoneLabel>\n' +
+      '  Add a new ship or add a zone to an existing ship by name.\n\n' +
+      '/removeship <mmsi>\n' +
+      '  Stop tracking a ship.\n\n' +
+      '/updatemmsi <name> <newMmsi>\n' +
+      '  Update the MMSI of an existing ship.\n\n' +
+      '/addzone <lat> <lon> <radiusKm> <zoneLabel>\n' +
+      '  Save a named zone for reuse with /addship.\n\n' +
+      '/listships\n' +
+      '  List all tracked ships and their zones.\n\n' +
+      '/help\n' +
+      '  Show this message.'
+    );
+    return;
+  }
+
   // ── Unknown command ──────────────────────────────────────────────────────────
-  await replyTelegram(chatId,
-    '🤖 Available commands:\n' +
-    '/addzone <lat> <lon> <radiusKm> <zoneLabel>\n' +
-    '/addship <mmsi> [name] [zone]\n' +
-    '/removeship <mmsi>\n' +
-    '/listships'
-  );
+  await replyTelegram(chatId, '❓ Unknown command. Use /help to see available commands.');
 }
 
 // ── Telegram polling loop ─────────────────────────────────────────────────────

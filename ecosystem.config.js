@@ -3,7 +3,7 @@ module.exports = {
     {
       name:        'ship-tracker',
       script:      'tracker.js',
-      cwd:         '/Users/YOUR_USERNAME/coding/shipTracking', // ← update this
+      cwd:         '/Users/youfeng/coding/shipTracking',
       watch:       false,
       restart_delay: 5000,
       env: {
