@@ -84,6 +84,7 @@ function buildBoundingBoxes() {
 const insideZone       = new Set(); // "mmsi::zoneLabel"
 const seenMmsis        = new Set(); // MMSIs heard since startup
 const pendingAisChecks = new Map(); // mmsi → { timer, chatId }
+const mmsiChangeAlerts = new Map(); // "trackedMmsi::newMmsi" → last alert ms (1hr cooldown)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,10 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function hasEnhancedTracking(ship) {
+  return !!(ship.callsign || (ship.altNames && ship.altNames.length > 0));
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -187,6 +192,18 @@ async function notifyExit(ship, zone, pos) {
   );
 }
 
+async function notifyPossibleMmsiChange(ship, newMmsi, reason, lat, lon) {
+  const key = `${ship.mmsi}::${newMmsi}`;
+  const now = Date.now();
+  if (mmsiChangeAlerts.has(key) && now - mmsiChangeAlerts.get(key) < 3_600_000) return;
+  mmsiChangeAlerts.set(key, now);
+  const label = ship.name || `MMSI ${ship.mmsi}`;
+  await notify(
+    `⚠️ POSSIBLE MMSI CHANGE\n🚢 ${label} (tracked MMSI ${ship.mmsi})\n📡 Spotted MMSI: ${newMmsi} (${reason})\n🌐 ${lat.toFixed(4)}, ${lon.toFixed(4)}\n🕐 ${new Date().toUTCString()}`,
+    { event: 'possible_mmsi_change', trackedMmsi: ship.mmsi, newMmsi, shipName: label, reason, lat, lon }
+  );
+}
+
 // ── AIS-off follow-up timer ───────────────────────────────────────────────────
 
 function scheduleAisCheck(mmsi, chatId) {
@@ -229,9 +246,58 @@ async function handleAisMessage(raw) {
   const mmsi = String(meta.MMSI);
   const lat  = meta.latitude;
   const lon  = meta.longitude;
-  const ship = SHIP_MAP[mmsi];
-  if (!ship) return;
 
+  // ── ShipStaticData: name/callsign matching against all enhanced-tracked ships ──
+  if (msg.MessageType === 'ShipStaticData') {
+    const sd         = msg.Message?.ShipStaticData;
+    const rxName     = (sd?.Name || meta.ShipName || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    const rxCallsign = (sd?.CallSign || '').trim().toUpperCase();
+    if (!rxName && !rxCallsign) return;
+
+    for (const trackedShip of SHIPS) {
+      if (String(trackedShip.mmsi) === mmsi) continue; // same MMSI — no alert
+      if (!hasEnhancedTracking(trackedShip)) continue;
+
+      let reason = null;
+      if (rxCallsign && trackedShip.callsign &&
+          rxCallsign === trackedShip.callsign.toUpperCase()) {
+        reason = `callsign "${rxCallsign}"`;
+      } else if (rxName) {
+        const names = [
+          (trackedShip.name || '').toUpperCase(),
+          ...((trackedShip.altNames || []).map(n => n.toUpperCase())),
+        ].filter(Boolean);
+        if (names.some(n => n && rxName === n)) reason = `name "${rxName}"`;
+      }
+      if (reason) await notifyPossibleMmsiChange(trackedShip, mmsi, reason, lat, lon);
+    }
+    return;
+  }
+
+  // ── PositionReport: normal tracking + MMSI-prefix proximity for unknown MMSI ──
+  const ship = SHIP_MAP[mmsi];
+
+  if (!ship) {
+    // Unknown MMSI: check if same prefix appears inside a zone of an enhanced-tracked ship
+    const prefix = mmsi.slice(0, 3);
+    for (const trackedShip of SHIPS) {
+      if (!hasEnhancedTracking(trackedShip)) continue;
+      if (!String(trackedShip.mmsi).startsWith(prefix)) continue;
+      for (const zone of (trackedShip.zones || [])) {
+        if (haversineKm(zone.lat, zone.lon, lat, lon) <= zone.radiusKm) {
+          await notifyPossibleMmsiChange(
+            trackedShip, mmsi,
+            `same MMSI prefix ${prefix} inside zone "${zone.label}"`,
+            lat, lon
+          );
+          break;
+        }
+      }
+    }
+    return;
+  }
+
+  // Known tracked ship — standard zone/AIS-on logic
   const displayName = ship.name || mmsi;
 
   if (!seenMmsis.has(mmsi)) {
@@ -370,12 +436,14 @@ async function handleCommand(text, chatId) {
       return;
     }
     const lines = SHIPS.map(s => {
-      const name   = s.name || '(unnamed)';
-      const status = seenMmsis.has(String(s.mmsi)) ? ' 🟢 AIS on' : ' 📵 AIS off';
-      const zones  = (s.zones || []).length > 0
+      const name     = s.name || '(unnamed)';
+      const status   = seenMmsis.has(String(s.mmsi)) ? ' 🟢 AIS on' : ' 📵 AIS off';
+      const zones    = (s.zones || []).length > 0
         ? (s.zones).map(z => `\n   📍 ${z.label} (${z.lat}, ${z.lon}) r=${z.radiusKm} km`).join('')
         : '\n   📍 No zone';
-      return `• ${name} — MMSI ${s.mmsi}${status}${zones}`;
+      const callsign = s.callsign ? `\n   📡 Callsign: ${s.callsign}` : '';
+      const altNames = (s.altNames || []).length > 0 ? `\n   🔤 Alt names: ${s.altNames.join(', ')}` : '';
+      return `• ${name} — MMSI ${s.mmsi}${status}${callsign}${altNames}${zones}`;
     });
     await replyTelegram(chatId, `📋 Tracked ships (${SHIPS.length}):\n\n${lines.join('\n\n')}`);
     return;
@@ -511,6 +579,83 @@ async function handleCommand(text, chatId) {
     return;
   }
 
+  // ── /setcallsign <name_or_mmsi> <callsign|clear> ────────────────────────────
+  if (trimmed.startsWith('/setcallsign')) {
+    const args = trimmed.slice('/setcallsign'.length).trim();
+    if (!args) {
+      await replyTelegram(chatId, '❌ Usage: /setcallsign <name_or_mmsi> <callsign>\nUse "clear" to remove the callsign.');
+      return;
+    }
+    const tokens = args.split(/\s+/);
+    if (tokens.length < 2) {
+      await replyTelegram(chatId, '❌ Usage: /setcallsign <name_or_mmsi> <callsign>\nUse "clear" to remove the callsign.');
+      return;
+    }
+    const callsignArg = tokens[tokens.length - 1];
+    const identifier  = tokens.slice(0, -1).join(' ');
+    const ship = /^\d{9}$/.test(identifier)
+      ? SHIP_MAP[identifier]
+      : SHIPS.find(s => s.name && s.name.toLowerCase() === identifier.toLowerCase());
+    if (!ship) {
+      await replyTelegram(chatId, `❌ No ship found for "${identifier}". Use /listships to see tracked ships.`);
+      return;
+    }
+    if (callsignArg.toLowerCase() === 'clear') {
+      delete ship.callsign;
+      saveShips();
+      reconnectWebSocket();
+      await replyTelegram(chatId, `✅ Callsign cleared for ${ship.name || ship.mmsi}.`);
+    } else {
+      ship.callsign = callsignArg.toUpperCase();
+      saveShips();
+      reconnectWebSocket();
+      await replyTelegram(chatId,
+        `✅ Callsign for ${ship.name || ship.mmsi} set to ${ship.callsign}\n` +
+        `📡 Enhanced MMSI-change detection now active.`
+      );
+    }
+    log(`Callsign ${callsignArg.toLowerCase() === 'clear' ? 'cleared' : 'set to ' + callsignArg.toUpperCase()} for MMSI ${ship.mmsi}`);
+    return;
+  }
+
+  // ── /addaltname <name_or_mmsi> <altName> ────────────────────────────────────
+  if (trimmed.startsWith('/addaltname')) {
+    const args = trimmed.slice('/addaltname'.length).trim();
+    if (!args) {
+      await replyTelegram(chatId, '❌ Usage: /addaltname <name_or_mmsi> <altName>');
+      return;
+    }
+    const tokens = args.split(/\s+/);
+    if (tokens.length < 2) {
+      await replyTelegram(chatId, '❌ Usage: /addaltname <name_or_mmsi> <altName>');
+      return;
+    }
+    const altName    = tokens[tokens.length - 1];
+    const identifier = tokens.slice(0, -1).join(' ');
+    const ship = /^\d{9}$/.test(identifier)
+      ? SHIP_MAP[identifier]
+      : SHIPS.find(s => s.name && s.name.toLowerCase() === identifier.toLowerCase());
+    if (!ship) {
+      await replyTelegram(chatId, `❌ No ship found for "${identifier}". Use /listships to see tracked ships.`);
+      return;
+    }
+    if (!ship.altNames) ship.altNames = [];
+    const upper = altName.toUpperCase();
+    if (ship.altNames.map(n => n.toUpperCase()).includes(upper)) {
+      await replyTelegram(chatId, `⚠️ "${altName}" is already an alt name for ${ship.name || ship.mmsi}.`);
+      return;
+    }
+    ship.altNames.push(altName);
+    saveShips();
+    reconnectWebSocket();
+    await replyTelegram(chatId,
+      `✅ Added alt name "${altName}" to ${ship.name || ship.mmsi}\n` +
+      `📡 Enhanced MMSI-change detection now active.`
+    );
+    log(`Added alt name "${altName}" to MMSI ${ship.mmsi}`);
+    return;
+  }
+
   // ── /updatemmsi <name> <newMmsi> ────────────────────────────────────────────
   if (trimmed.startsWith('/updatemmsi')) {
     const tokens = trimmed.slice('/updatemmsi'.length).trim().split(/\s+/);
@@ -570,6 +715,12 @@ async function handleCommand(text, chatId) {
       '  Stop tracking a ship.\n\n' +
       '/updatemmsi <name> <newMmsi>\n' +
       '  Update the MMSI of an existing ship.\n\n' +
+      '/setcallsign <name_or_mmsi> <callsign>\n' +
+      '/setcallsign <name_or_mmsi> clear\n' +
+      '  Set or clear the AIS callsign for a ship.\n' +
+      '  Enables MMSI-change detection via callsign + name matching.\n\n' +
+      '/addaltname <name_or_mmsi> <altName>\n' +
+      '  Add an alternative vessel name for MMSI-change detection.\n\n' +
       '/addzone <lat> <lon> <radiusKm> <zoneLabel>\n' +
       '  Save a named zone for reuse with /addship.\n\n' +
       '/listships\n' +
@@ -629,11 +780,14 @@ function connect() {
   ws.on('open', () => {
     reconnectDelay = 5000;
     log('Connected. Sending subscription...');
+    const enhanced = SHIPS.some(hasEnhancedTracking);
     ws.send(JSON.stringify({
       APIKey:             AISSTREAM_KEY,
       BoundingBoxes:      buildBoundingBoxes(),
-      FiltersShipMMSI:    SHIPS.map(s => String(s.mmsi)),
-      FilterMessageTypes: ['PositionReport'],
+      // When any ship has enhanced tracking, receive all vessels in the bounding
+      // boxes so we can match by name/callsign/MMSI-prefix from unknown MMSIs.
+      ...(enhanced ? {} : { FiltersShipMMSI: SHIPS.map(s => String(s.mmsi)) }),
+      FilterMessageTypes: enhanced ? ['PositionReport', 'ShipStaticData'] : ['PositionReport'],
     }));
   });
 
