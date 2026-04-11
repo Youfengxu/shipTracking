@@ -176,6 +176,90 @@ Similarly, edit `zones.json` to add or modify named zones.
 
 ---
 
+## OpenClaw integration
+
+The tracker integrates with [OpenClaw](https://openclaw.ai) so you can manage ships and
+query status via natural language or slash commands in your **Telegram group** — no SSH or
+file editing needed.
+
+### How it works
+
+OpenClaw's gateway polls Telegram and routes messages to the agent. Two skills are
+registered in `~/.openclaw/skills/`:
+
+| Skill | Purpose |
+|---|---|
+| `ship-tracker` | Manage ships and zones; handles all `/` commands and `@dll_snoop_bot` mentions |
+| `ais` | Query live vessel positions from the status API |
+
+The `ship-tracker` skill's Python scripts edit `ships.json` and `zones.json` directly.
+The file-watcher in `tracker.js` picks up the changes within ~500 ms — no pm2 restart.
+
+### Trigger rules
+
+The agent only responds to messages in the ship-tracking Telegram group that:
+- Start with `/` (slash command)
+- Mention `@dll_snoop_bot` or `@DLL_snoop` (natural language)
+
+All other messages are silently ignored.
+
+### Slash commands
+
+| Command | Effect |
+|---|---|
+| `/addship <mmsi>` | Start tracking a ship by MMSI (name auto-populates from AIS) |
+| `/addship <mmsi> <zone-label>` | Add with a saved zone |
+| `/addship <name\|callsign> <zone-label>` | Add a zone to an existing tracked ship |
+| `/removeship <mmsi>` | Stop tracking |
+| `/updatemmsi <name> <newMmsi>` | Update MMSI without losing zones or config |
+| `/setcallsign <name\|mmsi> <callsign>` | Set AIS callsign (enables MMSI-change detection) |
+| `/setcallsign <name\|mmsi> clear` | Remove callsign |
+| `/addaltname <name\|mmsi> <altName>` | Add an alternative broadcast name |
+| `/addzone <lat> <lon> <radius> <label>` | Save a reusable named zone |
+| `/listships` | List all tracked ships, zones, and callsigns |
+| `/shipstatus` | Live positions of all tracked ships (AIS on/off, location, last seen) |
+| `/help` | Show this command table |
+
+### Natural language examples
+
+Mention `@dll_snoop_bot` with a plain-English request:
+
+```
+@dll_snoop_bot track MMSI 525014092 in the Singapore Straits zone
+@dll_snoop_bot where are the ships right now?
+@dll_snoop_bot stop tracking KRI Bima Suci
+@dll_snoop_bot add the Singapore Straits zone to RSS Fearless
+```
+
+The agent resolves ship names and callsigns with fuzzy matching — it will suggest close
+matches if an exact name is not found, and will ask for clarification before acting when
+required information is missing (e.g. an MMSI that cannot be inferred).
+
+### Skill file locations
+
+```
+~/.openclaw/skills/ship-tracker/
+├── SKILL.md                        # agent routing rules and command table
+└── scripts/
+    ├── add_ship.py                 # /addship
+    ├── remove_ship.py              # /removeship
+    ├── list_ships.py               # /listships
+    ├── update_ship.py              # /updatemmsi, /setcallsign, /addaltname
+    ├── add_zone.py                 # /addzone
+    ├── ship_status.py              # single-ship lookup
+    └── shipstatus.py               # /shipstatus (all ships via HTTP API)
+
+~/.openclaw/skills/ais/
+├── SKILL.md                        # query routing rules
+└── scripts/
+    └── query_vessels.sh            # fetch live vessel list from status API
+```
+
+> ⚠️ The skill scripts use hardcoded absolute paths (`~/coding/shipTracking/ships.json`).
+> If you move the repo, update the paths in each script.
+
+---
+
 ## HTTP status API
 
 A lightweight HTTP server runs on `http://127.0.0.1:3001` (localhost only).
