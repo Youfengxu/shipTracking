@@ -4,13 +4,14 @@ Watches ships by MMSI via the free [aisstream.io](https://aisstream.io) WebSocke
 Each ship supports multiple configurable geo-fence zones. Alerts fire via **Telegram**,
 **Pushover**, and an optional **webhook** for three events:
 
-- 📡 **AIS turned on** — first position report received since tracker started
+- 📡 **AIS turned on** — ship returns to signal after 30+ minutes of silence
 - 🟢 **Zone entry** — ship crosses into a defined radius
 - 🔴 **Zone exit / departure** — ship crosses back out
 
-Ships and zones can be managed live via **Telegram commands** — no restart needed.
-Optional **enhanced MMSI-change detection** alerts you if a tracked ship appears to
-have changed its MMSI (matched by callsign, vessel name, or MMSI prefix).
+Ships and zones are managed by editing `ships.json` / `zones.json` directly — the tracker
+hot-reloads both files without a restart. Optional **enhanced MMSI-change detection** alerts
+you if a tracked ship appears to have changed its MMSI (matched by callsign, vessel name, or
+MMSI prefix).
 
 ---
 
@@ -38,6 +39,7 @@ Edit `ships.json` — one entry per ship. All fields except `mmsi` are optional:
   {
     "mmsi": "123456789",
     "name": "RSS Fearless",
+    "callsign": "S9F",
     "zones": [
       {
         "label": "Sembawang Naval Base",
@@ -53,138 +55,161 @@ Edit `ships.json` — one entry per ship. All fields except `mmsi` are optional:
 ]
 ```
 
-- Omit `"name"` → notifications show MMSI instead
-- Omit `"zones"` → only AIS-on alerts fire, no geofence
-- Each ship can have **multiple zones** (different locations and radii)
-- Add `"callsign"` and/or `"altNames"` to enable enhanced MMSI-change detection
+| Field | Description |
+|---|---|
+| `mmsi` | 9-digit MMSI (required) |
+| `name` | Friendly display name — auto-populated from AIS if omitted |
+| `callsign` | AIS callsign — auto-populated from AIS if omitted; enables MMSI-change detection |
+| `altNames` | Array of alternative broadcast names for MMSI-change detection |
+| `zones` | Array of geo-fence zones — omit for AIS-on alerts only |
 
 > 💡 Find MMSIs in the MarineTraffic app: tap a ship → Details → MMSI  
 > 💡 Get coordinates by long-pressing a location in Google Maps
 
-### 3. Fill in your .env
+### 3. Configure zones (optional)
+
+Edit `zones.json` to define reusable named zones:
+
+```json
+{
+  "Sembawang": {
+    "label": "Sembawang Naval Base",
+    "lat": 1.4585,
+    "lon": 103.8185,
+    "radiusKm": 3
+  }
+}
+```
+
+Reference a saved zone in `ships.json` by its key name. Both files are watched — changes apply
+within ~500 ms without restarting.
+
+### 4. Fill in your .env
+
+```
+AISSTREAM_KEY=your_key_here
+TG_TOKEN=your_telegram_bot_token
+TG_CHAT_ID=your_telegram_chat_id
+PUSHOVER_TOKEN=your_pushover_app_token   # optional
+PUSHOVER_USER=your_pushover_user_key     # optional
+WEBHOOK_URL=https://your-endpoint.com    # optional
+```
 
 | Variable | Where to get it |
 |---|---|
 | `AISSTREAM_KEY` | Sign up free at https://aisstream.io |
-| `PUSHOVER_TOKEN` / `PUSHOVER_USER` | https://pushover.net — create a free app |
 | `TG_TOKEN` | Message @BotFather on Telegram → /newbot |
-| `TG_CHAT_ID` | See Telegram Group Setup section below |
+| `TG_CHAT_ID` | See Telegram Group Setup below |
+| `PUSHOVER_TOKEN` / `PUSHOVER_USER` | https://pushover.net — create a free app |
 | `WEBHOOK_URL` | Your own endpoint, or leave blank to skip |
 
-### 4. Test it manually first
+### 5. Run it
 
 ```bash
 node tracker.js
 ```
 
-Startup logs will list each ship and its zone:
+Startup logs list each ship and its zones:
 ```
-[...] Tracking 2 ship(s):
+[...] Loaded 2 ship(s) from ships.json
+[...] Connecting to aisstream.io — tracking 2 ship(s)
 [...]   RSS Fearless (123456789) → "Sembawang Naval Base" r=3 km
 [...]   987654321 (987654321) → AIS-on only
 [...] Connected. Sending subscription...
+[...] HTTP status API listening on http://127.0.0.1:3001/status
 ```
 
 ---
 
-## Telegram commands
+## Alert examples
 
-Manage ships live by sending commands to your Telegram group.
-The bot polls for commands every **2.5 seconds**.
+Telegram alerts include **clickable coordinates** linking to Google Maps, and a
+**reverse-geocoded location** (sea name, city, or region) when available.
 
-Send `/help` to the bot at any time to see all commands.
-
-### /addship
-
-Add a new ship, or add a zone to an existing ship by name:
-
+**AIS turned on**
 ```
-/addship <mmsi>
-/addship <mmsi> <name>
-/addship <mmsi> <name> <lat> <lon> <radiusKm> [zoneLabel]
-/addship <mmsi> <name> <savedZoneLabel>
-/addship <name> <lat> <lon> <radiusKm> [zoneLabel]
-/addship <name> <savedZoneLabel>
+📡 AIS TURNED ON
+🚢 RSS Fearless (MMSI 123456789)
+🌐 1.4585, 103.8185   ← tappable link to Google Maps
+📍 Johor Strait
+🕐 Thu, 01 Jan 2026 00:00:00 GMT
 ```
 
-| Example | Effect |
+**Zone entry**
+```
+🟢 ZONE ENTRY
+🚢 RSS Fearless
+📍 Entered: Sembawang Naval Base
+🌐 1.4585, 103.8185 — 0.82 km from centre
+📍 Singapore
+🕐 Thu, 01 Jan 2026 00:00:00 GMT
+```
+
+**Zone exit**
+```
+🔴 ZONE EXIT / POSSIBLE DEPARTURE
+🚢 RSS Fearless
+📍 Left: Sembawang Naval Base
+🌐 1.4585, 103.8185
+📍 Johor Strait
+🕐 Thu, 01 Jan 2026 00:00:00 GMT
+```
+
+**Possible MMSI change**
+```
+⚠️ POSSIBLE MMSI CHANGE
+🚢 RSS Fearless (tracked MMSI 123456789)
+📡 Spotted MMSI: 123456799 (callsign "S9F")
+🌐 1.4585, 103.8185
+📍 Singapore
+🕐 Thu, 01 Jan 2026 00:00:00 GMT
+```
+
+---
+
+## Managing ships
+
+Edit `ships.json` directly — changes are picked up within ~500 ms without any restart.
+The WebSocket subscription is also automatically updated to reflect the new ship list.
+
+Similarly, edit `zones.json` to add or modify named zones.
+
+---
+
+## HTTP status API
+
+A lightweight HTTP server runs on `http://127.0.0.1:3001` (localhost only).
+
+**`GET /status`** — returns last known position for all tracked ships that have been seen:
+
+```json
+{
+  "123456789": {
+    "name": "RSS Fearless",
+    "lat": 1.4585,
+    "lon": 103.8185,
+    "ts": "2026-01-01T00:00:00.000Z",
+    "insideZones": ["Sembawang Naval Base"]
+  }
+}
+```
+
+| Field | Description |
 |---|---|
-| `/addship 123456789` | Track by MMSI only, no name, no zone |
-| `/addship 123456789 RSS Fearless` | Add with friendly name, no zone |
-| `/addship 123456789 RSS Fearless 1.4585 103.8185 3` | Add with name and zone |
-| `/addship 123456789 RSS Fearless 1.4585 103.8185 3 Sembawang` | Full config with zone label |
-| `/addship RSS Fearless Sembawang` | Add a saved zone to an existing ship |
+| `name` | Ship name (or MMSI if unnamed) |
+| `lat` / `lon` | Last reported coordinates |
+| `ts` | ISO timestamp of last position report |
+| `insideZones` | Array of zone labels the ship is currently inside |
 
-### /removeship
-
-```
-/removeship <mmsi>
-```
-
-Removes the ship from tracking immediately.
-
-### /updatemmsi
-
-```
-/updatemmsi <name> <newMmsi>
-```
-
-Updates the MMSI for an existing ship without losing its zones or configuration.
-Useful when a vessel's MMSI changes and you've confirmed the new one.
-
-### /addzone
-
-```
-/addzone <lat> <lon> <radiusKm> <zoneLabel>
-```
-
-Saves a named zone for reuse with `/addship`. Example:
-
-```
-/addzone 1.4585 103.8185 3 Sembawang Naval Base
-```
-
-### /setcallsign
-
-```
-/setcallsign <name_or_mmsi> <callsign>
-/setcallsign <name_or_mmsi> clear
-```
-
-Sets the AIS callsign for a ship. Enables enhanced MMSI-change detection — if any
-vessel broadcasts this callsign from a different MMSI, you'll get an alert.
-
-### /addaltname
-
-```
-/addaltname <name_or_mmsi> <altName>
-```
-
-Adds an alternative broadcast name for a ship (e.g. `TULSA` for a ship named `USS Tulsa`).
-Used for name-based MMSI-change detection alongside `/setcallsign`.
-
-### /listships
-
-```
-/listships
-```
-
-Lists all tracked ships with their MMSIs, AIS status, callsigns, alt names, and zones.
-
-### /help
-
-```
-/help
-```
-
-Shows all available commands and their syntax.
+Ships that have never been seen since startup are not included in the response.
 
 ---
 
 ## Enhanced MMSI-change detection
 
 Some vessels (particularly military and government ships) occasionally transmit under
-a different MMSI. Enable per-ship detection with `/setcallsign` and/or `/addaltname`.
+a different MMSI. Enable per-ship detection by setting `callsign` and/or `altNames` in
+`ships.json`.
 
 Once enabled, the tracker watches for:
 
@@ -193,20 +218,40 @@ Once enabled, the tracker watches for:
 2. **MMSI prefix proximity** — an unknown MMSI sharing the same 3-digit country prefix
    appearing inside the ship's zone
 
-Alert format:
-```
-⚠️ POSSIBLE MMSI CHANGE
-🚢 RSS Fearless (tracked MMSI 123456789)
-📡 Spotted MMSI: 123456799 (callsign "S9F")
-🌐 1.4585, 103.8185
-🕐 Thu, 01 Jan 2026 00:00:00 GMT
-```
-
 Alerts have a **1-hour cooldown** per MMSI pair to prevent spam.
 
-When enhanced detection is active for any ship, the subscription to aisstream.io
-broadens to all vessels within the tracked zones (instead of just tracked MMSIs),
-and also subscribes to `ShipStaticData` messages.
+When enhanced detection is active for any ship, the AIS subscription broadens to all
+vessels within the tracked bounding boxes (instead of just tracked MMSIs), and also
+subscribes to `ShipStaticData` messages.
+
+---
+
+## Auto-population of ship details
+
+If a ship entry in `ships.json` has no `name` or no `callsign`, the tracker will
+automatically fill those fields the first time a `ShipStaticData` message arrives for
+that MMSI. A Telegram message confirms what was populated:
+
+```
+📋 Ship details auto-populated
+🚢 MMSI 123456789
+   Name: RSS Fearless
+   Callsign: S9F
+```
+
+Naval prefixes (USS, HMS, HMAS, KRI, etc.) are preserved in uppercase when
+formatting the display name from the raw AIS broadcast.
+
+---
+
+## AIS-on detection
+
+A ship is considered "off" when no position report has been received for **30 minutes**
+(`STALE_MS`). The first position report after that silence triggers the AIS-on alert.
+
+To avoid spurious alerts immediately after the tracker starts or restarts, there is a
+**5-minute startup grace period** (`STARTUP_GRACE_MS`) during which AIS-on alerts are
+suppressed. This prevents every currently-broadcasting ship from firing an alert on boot.
 
 ---
 
@@ -256,7 +301,7 @@ pm2 save         # save current process list
 - Paste it as `TG_CHAT_ID` in `.env`
 
 **Step 4 — Invite people**
-Anyone in the group receives alerts. Anyone can also send bot commands.
+Anyone in the group receives alerts.
 
 > ⚠️ **Supergroup gotcha**: If Telegram upgrades your group to a supergroup,
 > the chat ID changes to `-100XXXXXXXXX`. Re-run `getUpdates` to get the new ID
@@ -266,30 +311,37 @@ Anyone in the group receives alerts. Anyone can also send bot commands.
 
 ## How it works
 
-1. Loads `zones.json` and `ships.json` on startup.
-2. Connects to `aisstream.io` via persistent WebSocket.
-   - Default: filtered to tracked MMSIs, `PositionReport` messages only.
-   - When any ship has enhanced tracking active: all vessels in bounding boxes,
-     plus `ShipStaticData` messages.
-3. **First position report** for a tracked ship → fires AIS-on alert.
-4. Each subsequent report → haversine distance check against all of that ship's zones.
-5. **Zone entry / exit** → fires alert on transition.
-6. **ShipStaticData from unknown MMSI** → name/callsign match check (enhanced mode).
-7. **PositionReport from unknown same-prefix MMSI inside a zone** → MMSI-change alert.
-8. **Telegram polling** runs every 2.5s in parallel — processes commands, updates
-   `ships.json`/`zones.json`, and reconnects the WebSocket with the new subscription.
-9. Auto-reconnects with exponential backoff on disconnect.
+1. **Startup** — loads `zones.json` then `ships.json`, builds bounding boxes from all zones,
+   starts the WebSocket connection, starts the HTTP status API on port 3001.
 
-> ⚠️ **AIS-on alert on restart**: Restarting the tracker re-fires the AIS-on alert
-> for any ship already broadcasting. This is expected.
+2. **WebSocket subscription** — subscribes to [aisstream.io](https://aisstream.io):
+   - Default (no enhanced tracking): filtered to tracked MMSIs, `PositionReport` only.
+   - Enhanced tracking active: all vessels in bounding boxes + `ShipStaticData` messages.
 
----
+3. **PositionReport received for a tracked MMSI:**
+   - Updates `lastPosition` map with current coords and timestamp.
+   - If the ship was "off" (no report for 30+ min) and startup grace period has elapsed →
+     fires AIS-on alert with reverse-geocoded location and clickable coords.
+   - Runs haversine distance check against each of the ship's zones.
+   - Zone entry/exit transitions fire the corresponding alert.
 
-## Adding or changing ships
+4. **PositionReport from unknown MMSI** (enhanced mode only):
+   - Checks if the unknown MMSI shares a 3-digit country prefix with any enhanced-tracked ship.
+   - If that unknown vessel is inside one of the ship's zones → fires MMSI-change alert.
 
-Preferred: use Telegram commands — live, no restart needed.
+5. **ShipStaticData from any MMSI** (enhanced mode only):
+   - Auto-populates `name` / `callsign` for the matching tracked ship if those fields are empty.
+   - For every *other* tracked ship with enhanced detection, checks if the broadcast
+     name or callsign matches → fires MMSI-change alert if so.
 
-Alternatively, edit `ships.json` directly and run:
-```bash
-pm2 restart ship-tracker
-```
+6. **Hot-reload** — `fs.watch` on `ships.json` and `zones.json` triggers a reload + WebSocket
+   reconnect within 500 ms of any file change.
+
+7. **Reconnection** — exponential backoff (5 s → 60 s max) on WebSocket disconnect.
+
+8. **Reverse geocoding** — all alert notifications call the Nominatim API to resolve lat/lon
+   to a human-readable place name (sea, bay, city, or country). Timeout is 5 s; failures
+   are silently skipped.
+
+9. **Telegram formatting** — outbound alerts use HTML parse mode so coordinates render as
+   tappable Google Maps links.

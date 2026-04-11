@@ -1,0 +1,14 @@
+{
+  "Singapore Straits": {
+    "label": "Singapore Straits",
+    "lat": 1.265,
+    "lon": 103.837,
+    "radiusKm": 35
+  },
+  "PB": {
+    "label": "PB",
+    "lat": 1.33,
+    "lon": 104.4,
+    "radiusKm": 10.0
+  }
+}

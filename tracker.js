@@ -11,7 +11,6 @@ const TG_TOKEN         = process.env.TG_TOKEN;
 const TG_CHAT_ID       = process.env.TG_CHAT_ID;
 const SHIPS_FILE       = path.join(__dirname, 'ships.json');
 const ZONES_FILE       = path.join(__dirname, 'zones.json');
-const POLL_INTERVAL    = 2500;  // ms — Telegram command polling frequency
 const AIS_CHECK_WINDOW = 30000; // ms — wait before "AIS still off" message
 
 // ── Ships state ───────────────────────────────────────────────────────────────
@@ -82,9 +81,12 @@ function buildBoundingBoxes() {
 // ── Runtime state ─────────────────────────────────────────────────────────────
 
 const insideZone       = new Set(); // "mmsi::zoneLabel"
-const seenMmsis        = new Set(); // MMSIs heard since startup
 const pendingAisChecks = new Map(); // mmsi → { timer, chatId }
 const mmsiChangeAlerts = new Map(); // "trackedMmsi::newMmsi" → last alert ms (1hr cooldown)
+const lastPosition     = new Map(); // mmsi → { lat, lon, ts }
+const STARTUP_GRACE_MS = 5 * 60 * 1000; // suppress restart-noise for 5 min after boot
+const STALE_MS         = 30 * 60 * 1000; // 30 min without signal = considered off
+const startupTime      = Date.now();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -107,6 +109,20 @@ function hasEnhancedTracking(ship) {
   return !!(ship.callsign || (ship.altNames && ship.altNames.length > 0));
 }
 
+const NAVAL_PREFIXES = new Set([
+  'USS','HMS','HMAS','HMNZS','KRI','KD','JS','MV','MT','SV',
+  'HDMS','FGS','FS','HNLMS','HTMS','KDB','RSS','INS','BRP','RFA',
+]);
+
+function aisNameToDisplay(raw) {
+  return raw.split(/\s+/).map(word => {
+    const upper = word.toUpperCase();
+    return NAVAL_PREFIXES.has(upper)
+      ? upper
+      : upper.charAt(0) + word.slice(1).toLowerCase();
+  }).join(' ');
+}
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 
 async function sendPushover(text) {
@@ -123,13 +139,12 @@ async function sendPushover(text) {
   }
 }
 
-async function sendTelegram(text) {
+async function sendTelegram(text, parseMode) {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
-      { chat_id: TG_CHAT_ID, text }
-    );
+    const body = { chat_id: TG_CHAT_ID, text };
+    if (parseMode) body.parse_mode = parseMode;
+    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, body);
   } catch (err) {
     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
     log(`Telegram error: ${detail}`);
@@ -145,11 +160,11 @@ async function sendWebhook(payload) {
   }
 }
 
-async function notify(text, payload) {
+async function notify(text, payload, tgHtml) {
   log(text.replace(/\n/g, ' | '));
   await Promise.allSettled([
     sendPushover(text),
-    sendTelegram(text),
+    sendTelegram(tgHtml || text, tgHtml ? 'HTML' : undefined),
     sendWebhook({ ...payload, timestamp: new Date().toISOString() }),
   ]);
 }
@@ -166,30 +181,65 @@ async function replyTelegram(chatId, text) {
   }
 }
 
+// ── Geocoding + coord formatting ──────────────────────────────────────────────
+
+async function reverseGeocode(lat, lon) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`;
+    const resp = await axios.get(url, {
+      headers: { 'User-Agent': 'ship-tracker/1.0' },
+      timeout: 5000,
+    });
+    const addr = resp.data.address || {};
+    if (addr.sea)   return addr.sea;
+    if (addr.ocean) return addr.ocean;
+    if (addr.bay)   return addr.bay;
+    const parts = [
+      addr.suburb || addr.quarter || addr.neighbourhood || addr.village || addr.town,
+      addr.city || addr.county || addr.state,
+      addr.country,
+    ].filter(Boolean);
+    return parts.slice(0, 2).join(', ') || null;
+  } catch {
+    return null;
+  }
+}
+
+function mapsUrl(lat, lon) {
+  return `https://www.google.com/maps?q=${lat.toFixed(4)},${lon.toFixed(4)}`;
+}
+
+function coordHtml(lat, lon) {
+  return `<a href="${mapsUrl(lat, lon)}">${lat.toFixed(4)}, ${lon.toFixed(4)}</a>`;
+}
+
 // ── AIS event notifications ───────────────────────────────────────────────────
 
 async function notifyAisOn(ship, pos) {
-  const label = ship.name || `MMSI ${ship.mmsi}`;
-  await notify(
-    `📡 AIS TURNED ON\n🚢 ${label} (MMSI ${ship.mmsi})\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}\n🕐 ${new Date().toUTCString()}`,
-    { event: 'ais_on', mmsi: ship.mmsi, shipName: label, lat: pos.lat, lon: pos.lon }
-  );
+  const label    = ship.name || `MMSI ${ship.mmsi}`;
+  const location = await reverseGeocode(pos.lat, pos.lon);
+  const locLine  = location ? `\n📍 ${location}` : '';
+  const plain    = `📡 AIS TURNED ON\n🚢 ${label} (MMSI ${ship.mmsi})\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  const html     = `📡 AIS TURNED ON\n🚢 ${label} (MMSI ${ship.mmsi})\n🌐 ${coordHtml(pos.lat, pos.lon)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  await notify(plain, { event: 'ais_on', mmsi: ship.mmsi, shipName: label, lat: pos.lat, lon: pos.lon }, html);
 }
 
 async function notifyEntry(ship, zone, pos) {
-  const label = ship.name || `MMSI ${ship.mmsi}`;
-  await notify(
-    `🟢 ZONE ENTRY\n🚢 ${label}\n📍 Entered: ${zone.label}\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)} — ${pos.distKm.toFixed(2)} km from centre\n🕐 ${new Date().toUTCString()}`,
-    { event: 'zone_entry', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon, distKm: pos.distKm }
-  );
+  const label    = ship.name || `MMSI ${ship.mmsi}`;
+  const location = await reverseGeocode(pos.lat, pos.lon);
+  const locLine  = location ? `\n📍 ${location}` : '';
+  const plain    = `🟢 ZONE ENTRY\n🚢 ${label}\n📍 Entered: ${zone.label}\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)} — ${pos.distKm.toFixed(2)} km from centre${locLine}\n🕐 ${new Date().toUTCString()}`;
+  const html     = `🟢 ZONE ENTRY\n🚢 ${label}\n📍 Entered: ${zone.label}\n🌐 ${coordHtml(pos.lat, pos.lon)} — ${pos.distKm.toFixed(2)} km from centre${locLine}\n🕐 ${new Date().toUTCString()}`;
+  await notify(plain, { event: 'zone_entry', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon, distKm: pos.distKm }, html);
 }
 
 async function notifyExit(ship, zone, pos) {
-  const label = ship.name || `MMSI ${ship.mmsi}`;
-  await notify(
-    `🔴 ZONE EXIT / POSSIBLE DEPARTURE\n🚢 ${label}\n📍 Left: ${zone.label}\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}\n🕐 ${new Date().toUTCString()}`,
-    { event: 'zone_exit', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon }
-  );
+  const label    = ship.name || `MMSI ${ship.mmsi}`;
+  const location = await reverseGeocode(pos.lat, pos.lon);
+  const locLine  = location ? `\n📍 ${location}` : '';
+  const plain    = `🔴 ZONE EXIT / POSSIBLE DEPARTURE\n🚢 ${label}\n📍 Left: ${zone.label}\n🌐 ${pos.lat.toFixed(4)}, ${pos.lon.toFixed(4)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  const html     = `🔴 ZONE EXIT / POSSIBLE DEPARTURE\n🚢 ${label}\n📍 Left: ${zone.label}\n🌐 ${coordHtml(pos.lat, pos.lon)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  await notify(plain, { event: 'zone_exit', mmsi: ship.mmsi, shipName: label, zone: zone.label, lat: pos.lat, lon: pos.lon }, html);
 }
 
 async function notifyPossibleMmsiChange(ship, newMmsi, reason, lat, lon) {
@@ -197,11 +247,12 @@ async function notifyPossibleMmsiChange(ship, newMmsi, reason, lat, lon) {
   const now = Date.now();
   if (mmsiChangeAlerts.has(key) && now - mmsiChangeAlerts.get(key) < 3_600_000) return;
   mmsiChangeAlerts.set(key, now);
-  const label = ship.name || `MMSI ${ship.mmsi}`;
-  await notify(
-    `⚠️ POSSIBLE MMSI CHANGE\n🚢 ${label} (tracked MMSI ${ship.mmsi})\n📡 Spotted MMSI: ${newMmsi} (${reason})\n🌐 ${lat.toFixed(4)}, ${lon.toFixed(4)}\n🕐 ${new Date().toUTCString()}`,
-    { event: 'possible_mmsi_change', trackedMmsi: ship.mmsi, newMmsi, shipName: label, reason, lat, lon }
-  );
+  const label    = ship.name || `MMSI ${ship.mmsi}`;
+  const location = await reverseGeocode(lat, lon);
+  const locLine  = location ? `\n📍 ${location}` : '';
+  const plain    = `⚠️ POSSIBLE MMSI CHANGE\n🚢 ${label} (tracked MMSI ${ship.mmsi})\n📡 Spotted MMSI: ${newMmsi} (${reason})\n🌐 ${lat.toFixed(4)}, ${lon.toFixed(4)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  const html     = `⚠️ POSSIBLE MMSI CHANGE\n🚢 ${label} (tracked MMSI ${ship.mmsi})\n📡 Spotted MMSI: ${newMmsi} (${reason})\n🌐 ${coordHtml(lat, lon)}${locLine}\n🕐 ${new Date().toUTCString()}`;
+  await notify(plain, { event: 'possible_mmsi_change', trackedMmsi: ship.mmsi, newMmsi, shipName: label, reason, lat, lon }, html);
 }
 
 // ── AIS-off follow-up timer ───────────────────────────────────────────────────
@@ -254,6 +305,29 @@ async function handleAisMessage(raw) {
     const rxCallsign = (sd?.CallSign || '').trim().toUpperCase();
     if (!rxName && !rxCallsign) return;
 
+    // Auto-populate name/callsign for tracked ships that are missing them
+    const ownShip = SHIP_MAP[mmsi];
+    if (ownShip && (!ownShip.name || !ownShip.callsign)) {
+      let updated = false;
+      if (rxName && !ownShip.name) {
+        ownShip.name = aisNameToDisplay(rxName);
+        updated = true;
+      }
+      if (rxCallsign && !ownShip.callsign) {
+        ownShip.callsign = rxCallsign;
+        updated = true;
+      }
+      if (updated) {
+        saveShips();
+        const label = ownShip.name || `MMSI ${mmsi}`;
+        log(`Auto-populated ${label} (MMSI ${mmsi}) — name=${ownShip.name || '–'} callsign=${ownShip.callsign || '–'}`);
+        const lines = [`📋 Ship details auto-populated`, `🚢 MMSI ${mmsi}`];
+        if (ownShip.name)     lines.push(`   Name: ${ownShip.name}`);
+        if (ownShip.callsign) lines.push(`   Callsign: ${ownShip.callsign}`);
+        await sendTelegram(lines.join('\n'));
+      }
+    }
+
     for (const trackedShip of SHIPS) {
       if (String(trackedShip.mmsi) === mmsi) continue; // same MMSI — no alert
       if (!hasEnhancedTracking(trackedShip)) continue;
@@ -300,10 +374,18 @@ async function handleAisMessage(raw) {
   // Known tracked ship — standard zone/AIS-on logic
   const displayName = ship.name || mmsi;
 
-  if (!seenMmsis.has(mmsi)) {
-    seenMmsis.add(mmsi);
+  // Check if ship was considered off before this update
+  const prev   = lastPosition.get(mmsi);
+  const wasOff = !prev || (Date.now() - new Date(prev.ts).getTime()) > STALE_MS;
+
+  // Update position
+  lastPosition.set(mmsi, { lat, lon, ts: new Date().toISOString() });
+
+  if (wasOff) {
     clearPendingAisCheck(mmsi);
-    await notifyAisOn(ship, { lat, lon });
+    if (Date.now() - startupTime > STARTUP_GRACE_MS) {
+      await notifyAisOn(ship, { lat, lon });
+    }
   }
 
   const zones = ship.zones || [];
@@ -327,439 +409,6 @@ async function handleAisMessage(raw) {
       await notifyExit(ship, zone, { lat, lon, distKm });
     }
   }
-}
-
-// ── Input validation ──────────────────────────────────────────────────────────
-
-function validateMmsi(mmsi) {
-  if (!/^\d{9}$/.test(mmsi))
-    return 'MMSI must be exactly 9 digits (e.g. 123456789).';
-  return null;
-}
-
-function validateZone(lat, lon, radiusKm) {
-  const errors = [];
-  if (isNaN(lat) || lat < -90 || lat > 90)
-    errors.push(`Latitude must be between -90 and 90 (got "${lat}").`);
-  if (isNaN(lon) || lon < -180 || lon > 180)
-    errors.push(`Longitude must be between -180 and 180 (got "${lon}").`);
-  if (isNaN(radiusKm) || radiusKm <= 0)
-    errors.push(`Radius must be a positive number greater than 0 (got "${radiusKm}").`);
-  return errors.length > 0 ? errors.join('\n') : null;
-}
-
-// ── /addship parser ───────────────────────────────────────────────────────────
-
-function parseZoneFromTokens(tokens, startIdx) {
-  for (let i = startIdx; i < tokens.length - 1; i++) {
-    const mayLat    = parseFloat(tokens[i]);
-    const mayLon    = parseFloat(tokens[i + 1]);
-    const mayRadius = tokens[i + 2] !== undefined ? parseFloat(tokens[i + 2]) : NaN;
-
-    if (!isNaN(mayLat) && !isNaN(mayLon) && !isNaN(mayRadius)) {
-      const zoneErr = validateZone(mayLat, mayLon, mayRadius);
-      if (zoneErr) return { error: zoneErr };
-      const zoneLabel = tokens.slice(i + 3).join(' ') || 'Zone';
-      return { zone: { label: zoneLabel, lat: mayLat, lon: mayLon, radiusKm: mayRadius }, zoneStart: i };
-    }
-  }
-  return { zone: null, zoneStart: -1 };
-}
-
-function findZoneLabelSuffix(tokens) {
-  for (let len = tokens.length; len >= 1; len--) {
-    const candidate = tokens.slice(-len).join(' ');
-    const zone = resolveZoneLabel(candidate);
-    if (zone) return { zone, prefixLen: tokens.length - len };
-  }
-  return null;
-}
-
-function parseAddShip(args) {
-  const tokens = args.trim().split(/\s+/);
-  if (tokens.length < 1 || !tokens[0]) return { error: 'No MMSI or ship name provided.' };
-
-  // MMSI-based: first token is exactly 9 digits
-  if (/^\d{9}$/.test(tokens[0])) {
-    const mmsi = tokens[0];
-    const rest = tokens.slice(1);
-
-    // Try coordinate triple first
-    const { zone, zoneStart, error } = parseZoneFromTokens(tokens, 1);
-    if (error) return { error };
-    if (zone) {
-      const name = tokens.slice(1, zoneStart).join(' ') || null;
-      return { mmsi, name, zone };
-    }
-
-    // Try registered zone label suffix
-    const match = findZoneLabelSuffix(rest);
-    if (match) {
-      const name = rest.slice(0, match.prefixLen).join(' ') || null;
-      return { mmsi, name, zone: match.zone };
-    }
-
-    // No zone
-    const name = rest.join(' ') || null;
-    return { mmsi, name, zone: null };
-  }
-
-  // Name-based: try coordinate triple first
-  const { zone, zoneStart, error } = parseZoneFromTokens(tokens, 0);
-  if (error) return { error };
-  if (zone) {
-    const shipName = tokens.slice(0, zoneStart).join(' ');
-    if (!shipName) return { error: 'No ship name provided.' };
-    return { byName: shipName, zone };
-  }
-
-  // Try registered zone label suffix
-  const match = findZoneLabelSuffix(tokens);
-  if (match) {
-    const shipName = tokens.slice(0, match.prefixLen).join(' ');
-    if (!shipName) return { error: 'No ship name provided.' };
-    return { byName: shipName, zone: match.zone };
-  }
-
-  return { error: 'No zone coordinates or known zone label found.\nUse /addzone to register a zone first, or provide coordinates: <lat> <lon> <radiusKm> [zoneLabel]' };
-}
-
-// ── Command handler ───────────────────────────────────────────────────────────
-
-async function handleCommand(text, chatId) {
-  const trimmed = text.trim();
-
-  // ── /listships ──────────────────────────────────────────────────────────────
-  if (trimmed === '/listships' || trimmed.startsWith('/listships ')) {
-    if (SHIPS.length === 0) {
-      await replyTelegram(chatId, '📋 No ships currently tracked.');
-      return;
-    }
-    const lines = SHIPS.map(s => {
-      const name     = s.name || '(unnamed)';
-      const status   = seenMmsis.has(String(s.mmsi)) ? ' 🟢 AIS on' : ' 📵 AIS off';
-      const zones    = (s.zones || []).length > 0
-        ? (s.zones).map(z => `\n   📍 ${z.label} (${z.lat}, ${z.lon}) r=${z.radiusKm} km`).join('')
-        : '\n   📍 No zone';
-      const callsign = s.callsign ? `\n   📡 Callsign: ${s.callsign}` : '';
-      const altNames = (s.altNames || []).length > 0 ? `\n   🔤 Alt names: ${s.altNames.join(', ')}` : '';
-      return `• ${name} — MMSI ${s.mmsi}${status}${callsign}${altNames}${zones}`;
-    });
-    await replyTelegram(chatId, `📋 Tracked ships (${SHIPS.length}):\n\n${lines.join('\n\n')}`);
-    return;
-  }
-
-  // ── /removeship <mmsi> ──────────────────────────────────────────────────────
-  if (trimmed.startsWith('/removeship')) {
-    const mmsi = trimmed.split(/\s+/)[1];
-    if (!mmsi) {
-      await replyTelegram(chatId, '❌ Usage: /removeship <mmsi>');
-      return;
-    }
-    const mmsiErr = validateMmsi(mmsi);
-    if (mmsiErr) {
-      await replyTelegram(chatId, `❌ ${mmsiErr}`);
-      return;
-    }
-    const idx = SHIPS.findIndex(s => String(s.mmsi) === mmsi);
-    if (idx === -1) {
-      await replyTelegram(chatId, `❌ MMSI ${mmsi} not found in tracking list.`);
-      return;
-    }
-    const removed = SHIPS.splice(idx, 1)[0];
-    delete SHIP_MAP[mmsi];
-    seenMmsis.delete(mmsi);
-    clearPendingAisCheck(mmsi);
-    saveShips();
-    reconnectWebSocket();
-    await replyTelegram(chatId, `✅ Removed ${removed.name || mmsi} (MMSI ${mmsi}) from tracking.`);
-    log(`Removed ship: ${mmsi}`);
-    return;
-  }
-
-  // ── /addzone <lat> <lon> <radiusKm> <zoneLabel> ─────────────────────────────
-  if (trimmed.startsWith('/addzone')) {
-    const args = trimmed.slice('/addzone'.length).trim();
-    if (!args) {
-      await replyTelegram(chatId, '❌ Usage: /addzone <lat> <lon> <radiusKm> <zoneLabel>');
-      return;
-    }
-    const tokens = args.split(/\s+/);
-    if (tokens.length < 4) {
-      await replyTelegram(chatId, '❌ All arguments required: /addzone <lat> <lon> <radiusKm> <zoneLabel>');
-      return;
-    }
-    const lat      = parseFloat(tokens[0]);
-    const lon      = parseFloat(tokens[1]);
-    const radiusKm = parseFloat(tokens[2]);
-    const label    = tokens.slice(3).join(' ');
-    const zoneErr  = validateZone(lat, lon, radiusKm);
-    if (zoneErr) {
-      await replyTelegram(chatId, `❌ ${zoneErr}`);
-      return;
-    }
-    ZONES[label] = { label, lat, lon, radiusKm };
-    saveZones();
-    await replyTelegram(chatId, `✅ Zone "${label}" saved\n📍 (${lat}, ${lon}) radius ${radiusKm} km`);
-    log(`Added zone: ${label} (${lat}, ${lon}) r=${radiusKm} km`);
-    return;
-  }
-
-  // ── /addship <mmsi> [name] [lat lon radiusKm [zoneLabel]] ───────────────────
-  if (trimmed.startsWith('/addship')) {
-    const args = trimmed.slice('/addship'.length).trim();
-    if (!args) {
-      await replyTelegram(chatId,
-        '❌ Usage:\n' +
-        '/addship <mmsi>\n' +
-        '/addship <mmsi> <name>\n' +
-        '/addship <mmsi> <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
-        '/addship <mmsi> <name> <savedZoneLabel>\n\n' +
-        'To add a zone to an existing ship by name:\n' +
-        '/addship <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
-        '/addship <name> <savedZoneLabel>\n\n' +
-        'Register zones first with /addzone.\n' +
-        'MMSI must be exactly 9 digits.\n' +
-        'Lat: -90 to 90 | Lon: -180 to 180 | Radius: > 0'
-      );
-      return;
-    }
-
-    const parsed = parseAddShip(args);
-    if (parsed.error) {
-      await replyTelegram(chatId, `❌ ${parsed.error}`);
-      return;
-    }
-
-    // Name-based: add a zone to an existing ship
-    if (parsed.byName !== undefined) {
-      const nameLower = parsed.byName.toLowerCase();
-      const existing  = SHIPS.find(s => s.name && s.name.toLowerCase() === nameLower);
-      if (!existing) {
-        await replyTelegram(chatId, `❌ No ship named "${parsed.byName}" found. Use /listships to see tracked ships.`);
-        return;
-      }
-      existing.zones.push(parsed.zone);
-      saveShips();
-      reconnectWebSocket();
-      const z = parsed.zone;
-      await replyTelegram(chatId,
-        `✅ Added zone to ${existing.name} (MMSI ${existing.mmsi})\n` +
-        `📍 ${z.label} (${z.lat}, ${z.lon}) radius ${z.radiusKm} km`
-      );
-      log(`Added zone to ship ${existing.mmsi}: ${JSON.stringify(parsed.zone)}`);
-      return;
-    }
-
-    const { mmsi, name, zone } = parsed;
-
-    if (SHIP_MAP[mmsi]) {
-      await replyTelegram(chatId, `⚠️ MMSI ${mmsi} is already being tracked. Use /removeship ${mmsi} first.`);
-      return;
-    }
-
-    const ship = { mmsi, ...(name && { name }), zones: zone ? [zone] : [] };
-    SHIPS.push(ship);
-    SHIP_MAP[mmsi] = ship;
-    saveShips();
-    reconnectWebSocket();
-
-    const nameStr = name || '(unnamed)';
-    const zoneStr = zone
-      ? `\n📍 Zone: ${zone.label} (${zone.lat}, ${zone.lon}) radius ${zone.radiusKm} km`
-      : '\n📍 No zone — AIS-on alert only';
-    const secs = AIS_CHECK_WINDOW / 1000;
-
-    await replyTelegram(chatId,
-      `✅ Added ${nameStr} (MMSI ${mmsi})${zoneStr}\n` +
-      `⏳ Checking for AIS signal — will confirm within ${secs}s...`
-    );
-    scheduleAisCheck(mmsi, chatId);
-    log(`Added ship: ${mmsi} name=${name} zones=${JSON.stringify(ship.zones)}`);
-    return;
-  }
-
-  // ── /setcallsign <name_or_mmsi> <callsign|clear> ────────────────────────────
-  if (trimmed.startsWith('/setcallsign')) {
-    const args = trimmed.slice('/setcallsign'.length).trim();
-    if (!args) {
-      await replyTelegram(chatId, '❌ Usage: /setcallsign <name_or_mmsi> <callsign>\nUse "clear" to remove the callsign.');
-      return;
-    }
-    const tokens = args.split(/\s+/);
-    if (tokens.length < 2) {
-      await replyTelegram(chatId, '❌ Usage: /setcallsign <name_or_mmsi> <callsign>\nUse "clear" to remove the callsign.');
-      return;
-    }
-    const callsignArg = tokens[tokens.length - 1];
-    const identifier  = tokens.slice(0, -1).join(' ');
-    const ship = /^\d{9}$/.test(identifier)
-      ? SHIP_MAP[identifier]
-      : SHIPS.find(s => s.name && s.name.toLowerCase() === identifier.toLowerCase());
-    if (!ship) {
-      await replyTelegram(chatId, `❌ No ship found for "${identifier}". Use /listships to see tracked ships.`);
-      return;
-    }
-    if (callsignArg.toLowerCase() === 'clear') {
-      delete ship.callsign;
-      saveShips();
-      reconnectWebSocket();
-      await replyTelegram(chatId, `✅ Callsign cleared for ${ship.name || ship.mmsi}.`);
-    } else {
-      ship.callsign = callsignArg.toUpperCase();
-      saveShips();
-      reconnectWebSocket();
-      await replyTelegram(chatId,
-        `✅ Callsign for ${ship.name || ship.mmsi} set to ${ship.callsign}\n` +
-        `📡 Enhanced MMSI-change detection now active.`
-      );
-    }
-    log(`Callsign ${callsignArg.toLowerCase() === 'clear' ? 'cleared' : 'set to ' + callsignArg.toUpperCase()} for MMSI ${ship.mmsi}`);
-    return;
-  }
-
-  // ── /addaltname <name_or_mmsi> <altName> ────────────────────────────────────
-  if (trimmed.startsWith('/addaltname')) {
-    const args = trimmed.slice('/addaltname'.length).trim();
-    if (!args) {
-      await replyTelegram(chatId, '❌ Usage: /addaltname <name_or_mmsi> <altName>');
-      return;
-    }
-    const tokens = args.split(/\s+/);
-    if (tokens.length < 2) {
-      await replyTelegram(chatId, '❌ Usage: /addaltname <name_or_mmsi> <altName>');
-      return;
-    }
-    const altName    = tokens[tokens.length - 1];
-    const identifier = tokens.slice(0, -1).join(' ');
-    const ship = /^\d{9}$/.test(identifier)
-      ? SHIP_MAP[identifier]
-      : SHIPS.find(s => s.name && s.name.toLowerCase() === identifier.toLowerCase());
-    if (!ship) {
-      await replyTelegram(chatId, `❌ No ship found for "${identifier}". Use /listships to see tracked ships.`);
-      return;
-    }
-    if (!ship.altNames) ship.altNames = [];
-    const upper = altName.toUpperCase();
-    if (ship.altNames.map(n => n.toUpperCase()).includes(upper)) {
-      await replyTelegram(chatId, `⚠️ "${altName}" is already an alt name for ${ship.name || ship.mmsi}.`);
-      return;
-    }
-    ship.altNames.push(altName);
-    saveShips();
-    reconnectWebSocket();
-    await replyTelegram(chatId,
-      `✅ Added alt name "${altName}" to ${ship.name || ship.mmsi}\n` +
-      `📡 Enhanced MMSI-change detection now active.`
-    );
-    log(`Added alt name "${altName}" to MMSI ${ship.mmsi}`);
-    return;
-  }
-
-  // ── /updatemmsi <name> <newMmsi> ────────────────────────────────────────────
-  if (trimmed.startsWith('/updatemmsi')) {
-    const tokens = trimmed.slice('/updatemmsi'.length).trim().split(/\s+/);
-    if (tokens.length < 2 || !tokens[0]) {
-      await replyTelegram(chatId, '❌ Usage: /updatemmsi <name> <newMmsi>');
-      return;
-    }
-    const newMmsi   = tokens[tokens.length - 1];
-    const shipName  = tokens.slice(0, -1).join(' ');
-    const mmsiErr   = validateMmsi(newMmsi);
-    if (mmsiErr) {
-      await replyTelegram(chatId, `❌ ${mmsiErr}`);
-      return;
-    }
-    const nameLower = shipName.toLowerCase();
-    const ship      = SHIPS.find(s => s.name && s.name.toLowerCase() === nameLower);
-    if (!ship) {
-      await replyTelegram(chatId, `❌ No ship named "${shipName}" found. Use /listships to see tracked ships.`);
-      return;
-    }
-    if (SHIP_MAP[newMmsi]) {
-      await replyTelegram(chatId, `⚠️ MMSI ${newMmsi} is already assigned to ${SHIP_MAP[newMmsi].name || newMmsi}.`);
-      return;
-    }
-    const oldMmsi = String(ship.mmsi);
-    // migrate runtime state keyed on old MMSI
-    clearPendingAisCheck(oldMmsi);
-    seenMmsis.delete(oldMmsi);
-    for (const key of insideZone) {
-      if (key.startsWith(oldMmsi + '::')) {
-        insideZone.delete(key);
-        insideZone.add(newMmsi + '::' + key.slice(oldMmsi.length + 2));
-      }
-    }
-    delete SHIP_MAP[oldMmsi];
-    ship.mmsi = newMmsi;
-    SHIP_MAP[newMmsi] = ship;
-    saveShips();
-    reconnectWebSocket();
-    await replyTelegram(chatId, `✅ ${ship.name}: MMSI updated ${oldMmsi} → ${newMmsi}`);
-    log(`Updated MMSI for ${ship.name}: ${oldMmsi} → ${newMmsi}`);
-    return;
-  }
-
-  // ── /help ────────────────────────────────────────────────────────────────────
-  if (trimmed === '/help' || trimmed.startsWith('/help ')) {
-    await replyTelegram(chatId,
-      '🤖 Commands:\n\n' +
-      '/addship <mmsi>\n' +
-      '/addship <mmsi> <name>\n' +
-      '/addship <mmsi> <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
-      '/addship <mmsi> <name> <savedZoneLabel>\n' +
-      '/addship <name> <lat> <lon> <radiusKm> [zoneLabel]\n' +
-      '/addship <name> <savedZoneLabel>\n' +
-      '  Add a new ship or add a zone to an existing ship by name.\n\n' +
-      '/removeship <mmsi>\n' +
-      '  Stop tracking a ship.\n\n' +
-      '/updatemmsi <name> <newMmsi>\n' +
-      '  Update the MMSI of an existing ship.\n\n' +
-      '/setcallsign <name_or_mmsi> <callsign>\n' +
-      '/setcallsign <name_or_mmsi> clear\n' +
-      '  Set or clear the AIS callsign for a ship.\n' +
-      '  Enables MMSI-change detection via callsign + name matching.\n\n' +
-      '/addaltname <name_or_mmsi> <altName>\n' +
-      '  Add an alternative vessel name for MMSI-change detection.\n\n' +
-      '/addzone <lat> <lon> <radiusKm> <zoneLabel>\n' +
-      '  Save a named zone for reuse with /addship.\n\n' +
-      '/listships\n' +
-      '  List all tracked ships and their zones.\n\n' +
-      '/help\n' +
-      '  Show this message.'
-    );
-    return;
-  }
-
-  // ── Unknown command ──────────────────────────────────────────────────────────
-  await replyTelegram(chatId, '❓ Unknown command. Use /help to see available commands.');
-}
-
-// ── Telegram polling loop ─────────────────────────────────────────────────────
-
-let lastUpdateId = 0;
-
-async function pollTelegram() {
-  if (!TG_TOKEN) return;
-  try {
-    const res = await axios.get(
-      `https://api.telegram.org/bot${TG_TOKEN}/getUpdates`,
-      { params: { offset: lastUpdateId + 1, timeout: 0 } }
-    );
-    const updates = res.data.result || [];
-    for (const update of updates) {
-      lastUpdateId = update.update_id;
-      const msg = update.message;
-      if (!msg || !msg.text) continue;
-      const text = msg.text;
-      if (!text.startsWith('/')) continue;
-      log(`Command received: ${text}`);
-      await handleCommand(text, msg.chat.id);
-    }
-  } catch (err) {
-    log(`Telegram poll error: ${err.message}`);
-  }
-  setTimeout(pollTelegram, POLL_INTERVAL);
 }
 
 // ── WebSocket connection ──────────────────────────────────────────────────────
@@ -818,6 +467,55 @@ if (!AISSTREAM_KEY || AISSTREAM_KEY === 'your_aisstream_api_key_here') {
 
 loadZones();
 loadShips();
-for (const ship of SHIPS) scheduleAisCheck(String(ship.mmsi), TG_CHAT_ID);
 connect();
-pollTelegram();
+
+// ── File watchers — auto-reload without restart ───────────────────────────────
+
+let reloadShipsTimer = null;
+fs.watch(SHIPS_FILE, () => {
+  clearTimeout(reloadShipsTimer);
+  reloadShipsTimer = setTimeout(() => {
+    log('ships.json changed — reloading...');
+    loadShips();
+    reconnectWebSocket();
+  }, 500);
+});
+
+let reloadZonesTimer = null;
+fs.watch(ZONES_FILE, () => {
+  clearTimeout(reloadZonesTimer);
+  reloadZonesTimer = setTimeout(() => {
+    log('zones.json changed — reloading...');
+    loadZones();
+  }, 500);
+});
+
+// ── HTTP status API ───────────────────────────────────────────────────────────
+
+const http = require('http');
+http.createServer((req, res) => {
+  if (req.url === '/status') {
+    const out = {};
+    for (const [mmsi, pos] of lastPosition) {
+      const ship       = SHIP_MAP[mmsi];
+      const zones      = ship ? (ship.zones || []) : [];
+      const activeZones = zones
+        .filter(z => z.label && insideZone.has(`${mmsi}::${z.label}`))
+        .map(z => z.label);
+      out[mmsi] = {
+        name:        ship ? (ship.name || mmsi) : mmsi,
+        lat:         pos.lat,
+        lon:         pos.lon,
+        ts:          pos.ts,
+        insideZones: activeZones,
+      };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(out));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+}).listen(3001, '127.0.0.1', () => {
+  log('HTTP status API listening on http://127.0.0.1:3001/status');
+});
