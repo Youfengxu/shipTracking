@@ -8,10 +8,10 @@ Each ship supports multiple configurable geo-fence zones. Alerts fire via **Tele
 - 🟢 **Zone entry** — ship crosses into a defined radius
 - 🔴 **Zone exit / departure** — ship crosses back out
 
-Ships and zones are managed by editing `ships.json` / `zones.json` directly — the tracker
-hot-reloads both files without a restart. Optional **enhanced MMSI-change detection** alerts
-you if a tracked ship appears to have changed its MMSI (matched by callsign, vessel name, or
-MMSI prefix).
+Ships and zones are managed via **Telegram slash commands** (or by editing `ships.json` /
+`zones.json` directly). The tracker hot-reloads both files without a restart. Optional
+**enhanced MMSI-change detection** alerts you if a tracked ship appears to have changed
+its MMSI (matched by callsign, vessel name, or MMSI prefix).
 
 ---
 
@@ -81,8 +81,8 @@ Edit `zones.json` to define reusable named zones:
 }
 ```
 
-Reference a saved zone in `ships.json` by its key name. Both files are watched — changes apply
-within ~500 ms without restarting.
+Reference a saved zone by its key name when using `/addzone`. Both files are watched —
+changes apply within ~500 ms without restarting.
 
 ### 4. Fill in your .env
 
@@ -93,6 +93,10 @@ TG_CHAT_ID=your_telegram_chat_id
 PUSHOVER_TOKEN=your_pushover_app_token   # optional
 PUSHOVER_USER=your_pushover_user_key     # optional
 WEBHOOK_URL=https://your-endpoint.com    # optional
+
+# Beta: Ollama NL query (see below)
+LLAMA_URL=http://127.0.0.1:11435         # optional
+LLAMA_MODEL=llama3                       # optional
 ```
 
 | Variable | Where to get it |
@@ -102,11 +106,15 @@ WEBHOOK_URL=https://your-endpoint.com    # optional
 | `TG_CHAT_ID` | See Telegram Group Setup below |
 | `PUSHOVER_TOKEN` / `PUSHOVER_USER` | https://pushover.net — create a free app |
 | `WEBHOOK_URL` | Your own endpoint, or leave blank to skip |
+| `LLAMA_URL` | Base URL of a running Ollama instance (leave blank to disable NL) |
+| `LLAMA_MODEL` | Ollama model to use for NL queries (default: `llama3`) |
 
 ### 5. Run it
 
 ```bash
 node tracker.js
+# or with auto-restart on file changes:
+npm run dev
 ```
 
 Startup logs list each ship and its zones:
@@ -117,13 +125,108 @@ Startup logs list each ship and its zones:
 [...]   987654321 (987654321) → AIS-on only
 [...] Connected. Sending subscription...
 [...] HTTP status API listening on http://127.0.0.1:3001/status
+[...] Telegram bot: @your_bot — polling for commands
 ```
+
+---
+
+## Telegram commands
+
+The tracker polls Telegram continuously and handles all slash commands natively — no
+external agent or proxy is needed. Send commands directly to the bot (private chat) or
+in any group the bot is a member of.
+
+### Status & lookup
+
+| Command | Description |
+|---|---|
+| `/status` | Last known position of all tracked ships — online/dark indicator, age, active zones |
+| `/ping <name or mmsi>` | Detailed status for one ship — coordinates, reverse-geocoded location, age |
+| `/listships` | All tracked ships with their MMSIs and zones |
+| `/listzones` | All named zones from `zones.json` with coordinates and radii |
+| `/help` | Full command reference |
+
+### Managing ships
+
+| Command | Description |
+|---|---|
+| `/addship <mmsi> [name]` | Start tracking a new ship (name auto-fills from AIS) |
+| `/removeship <name or mmsi>` | Stop tracking a ship |
+| `/setname <mmsi> <name>` | Rename a tracked ship |
+| `/setcallsign <ship> <callsign>` | Set AIS callsign; use `none` to clear |
+| `/addaltname <ship> <alt>` | Add an alternate broadcast name for MMSI-change detection |
+| `/rmaltname <ship> <alt>` | Remove an alternate broadcast name |
+| `/undo` | Revert the last change to the ship list |
+
+### Managing zones
+
+| Command | Description |
+|---|---|
+| `/addzone <ship> <zone> [radiusKm]` | Add a named zone (from `/listzones`) to a ship |
+| `/addzone <ship> <lat,lon,radius>` | Add an inline zone by raw coordinates |
+| `/rmzone <ship> <zone>` | Remove a zone from a ship |
+
+### MMSI-change suspects
+
+| Command | Description |
+|---|---|
+| `/listsuspect` | Show all recorded suspect MMSIs (possible identity changes) |
+| `/clearsuspect <mmsi>` | Remove a suspect MMSI from the list |
+
+### Examples
+
+```
+/addship 368926114 USS Tulsa
+/setcallsign "USS Tulsa" NFGP
+/addaltname "USS Tulsa" TULSA
+/addzone "USS Tulsa" "Singapore Straits"
+/addzone "USS Tulsa" "Sembawang Naval Base" 3
+/ping USS Tulsa
+/rmzone "USS Tulsa" "Singapore Straits"
+/removeship USS Tulsa
+```
+
+---
+
+## Beta: Natural language via Ollama
+
+When `LLAMA_URL` is set in `.env`, the bot accepts **plain-English messages** in addition
+to slash commands. This works in:
+
+- **Private chat** — any message to the bot is treated as a natural language query
+- **Group chat** — messages that mention `@your_bot` are processed as NL queries
+
+The bot sends the message to a local [Ollama](https://ollama.com) instance, which maps it
+to one or more slash commands using a structured prompt that includes the current ship and
+zone lists. The resolved commands are then executed normally.
+
+**Examples:**
+
+```
+"Track MMSI 525014092 in the Singapore Straits zone"
+"Where is RSS Fearless right now?"
+"Stop tracking KRI Bima Suci"
+"Rename RMN Warship 174 to Warship"
+"Undo that"
+```
+
+> ⚠️ This feature requires a locally running Ollama instance. It adds ~90 s timeout per
+> query and is intended for experimentation, not production use.
+
+**Setup:**
+
+1. Install [Ollama](https://ollama.com) and pull your chosen model: `ollama pull llama3`
+2. Set `LLAMA_URL` and `LLAMA_MODEL` in `.env`
+3. Send `SIGHUP` to reload without restarting: `kill -HUP $(pm2 pid ship-tracker)`
+
+If the model is not found or Ollama returns an error, the bot replies with a descriptive
+error message rather than silently failing.
 
 ---
 
 ## Alert examples
 
-Telegram alerts include **clickable coordinates** linking to Google Maps, and a
+Telegram alerts include **clickable coordinates** linking to Google Maps and a
 **reverse-geocoded location** (sea name, city, or region) when available.
 
 **AIS turned on**
@@ -167,104 +270,11 @@ Telegram alerts include **clickable coordinates** linking to Google Maps, and a
 
 ---
 
-## Managing ships
-
-Edit `ships.json` directly — changes are picked up within ~500 ms without any restart.
-The WebSocket subscription is also automatically updated to reflect the new ship list.
-
-Similarly, edit `zones.json` to add or modify named zones.
-
----
-
-## OpenClaw integration
-
-The tracker integrates with [OpenClaw](https://openclaw.ai) so you can manage ships and
-query status via natural language or slash commands in your **Telegram group** — no SSH or
-file editing needed.
-
-### How it works
-
-OpenClaw's gateway polls Telegram and routes messages to the agent. Two skills are
-registered in `~/.openclaw/skills/`:
-
-| Skill | Purpose |
-|---|---|
-| `ship-tracker` | Manage ships and zones; handles all `/` commands and `@dll_snoop_bot` mentions |
-| `ais` | Query live vessel positions from the status API |
-
-The `ship-tracker` skill's Python scripts edit `ships.json` and `zones.json` directly.
-The file-watcher in `tracker.js` picks up the changes within ~500 ms — no pm2 restart.
-
-### Trigger rules
-
-The agent only responds to messages in the ship-tracking Telegram group that:
-- Start with `/` (slash command)
-- Mention `@dll_snoop_bot` or `@DLL_snoop` (natural language)
-
-All other messages are silently ignored.
-
-### Slash commands
-
-| Command | Effect |
-|---|---|
-| `/addship <mmsi>` | Start tracking a ship by MMSI (name auto-populates from AIS) |
-| `/addship <mmsi> <zone-label>` | Add with a saved zone |
-| `/addship <name\|callsign> <zone-label>` | Add a zone to an existing tracked ship |
-| `/removeship <mmsi>` | Stop tracking |
-| `/updatemmsi <name> <newMmsi>` | Update MMSI without losing zones or config |
-| `/setcallsign <name\|mmsi> <callsign>` | Set AIS callsign (enables MMSI-change detection) |
-| `/setcallsign <name\|mmsi> clear` | Remove callsign |
-| `/addaltname <name\|mmsi> <altName>` | Add an alternative broadcast name |
-| `/addzone <lat> <lon> <radius> <label>` | Save a reusable named zone |
-| `/listships` | List all tracked ships, zones, and callsigns |
-| `/shipstatus` | Live positions of all tracked ships (AIS on/off, location, last seen) |
-| `/help` | Show this command table |
-
-### Natural language examples
-
-Mention `@dll_snoop_bot` with a plain-English request:
-
-```
-@dll_snoop_bot track MMSI 525014092 in the Singapore Straits zone
-@dll_snoop_bot where are the ships right now?
-@dll_snoop_bot stop tracking KRI Bima Suci
-@dll_snoop_bot add the Singapore Straits zone to RSS Fearless
-```
-
-The agent resolves ship names and callsigns with fuzzy matching — it will suggest close
-matches if an exact name is not found, and will ask for clarification before acting when
-required information is missing (e.g. an MMSI that cannot be inferred).
-
-### Skill file locations
-
-```
-~/.openclaw/skills/ship-tracker/
-├── SKILL.md                        # agent routing rules and command table
-└── scripts/
-    ├── add_ship.py                 # /addship
-    ├── remove_ship.py              # /removeship
-    ├── list_ships.py               # /listships
-    ├── update_ship.py              # /updatemmsi, /setcallsign, /addaltname
-    ├── add_zone.py                 # /addzone
-    ├── ship_status.py              # single-ship lookup
-    └── shipstatus.py               # /shipstatus (all ships via HTTP API)
-
-~/.openclaw/skills/ais/
-├── SKILL.md                        # query routing rules
-└── scripts/
-    └── query_vessels.sh            # fetch live vessel list from status API
-```
-
-> ⚠️ The skill scripts use hardcoded absolute paths (`~/coding/shipTracking/ships.json`).
-> If you move the repo, update the paths in each script.
-
----
-
 ## HTTP status API
 
 A lightweight HTTP server runs on `http://127.0.0.1:3001` (localhost only).
 
-**`GET /status`** — returns last known position for all tracked ships that have been seen:
+**`GET /status`** — returns last known state for all tracked ships:
 
 ```json
 {
@@ -273,7 +283,9 @@ A lightweight HTTP server runs on `http://127.0.0.1:3001` (localhost only).
     "lat": 1.4585,
     "lon": 103.8185,
     "ts": "2026-01-01T00:00:00.000Z",
-    "insideZones": ["Sembawang Naval Base"]
+    "insideZones": ["Sembawang Naval Base"],
+    "hasBroadcast": true,
+    "isOnline": true
   }
 }
 ```
@@ -283,9 +295,22 @@ A lightweight HTTP server runs on `http://127.0.0.1:3001` (localhost only).
 | `name` | Ship name (or MMSI if unnamed) |
 | `lat` / `lon` | Last reported coordinates |
 | `ts` | ISO timestamp of last position report |
-| `insideZones` | Array of zone labels the ship is currently inside |
+| `insideZones` | Zone labels the ship is currently inside |
+| `hasBroadcast` | Whether the ship has been seen at all since startup |
+| `isOnline` | `true` if a position was received within the last 30 minutes |
 
-Ships that have never been seen since startup are not included in the response.
+Ships that have never been seen since startup are included with `null` position fields.
+
+---
+
+## State persistence
+
+The tracker saves position and zone state to `state.json` every 5 seconds (throttled).
+On restart, this file is loaded so that `/status` and `/ping` show last-known positions
+immediately without waiting for fresh AIS data, and zone-entry state is preserved across
+restarts to avoid spurious entry/exit alerts.
+
+`state.json` is managed automatically — do not edit it manually.
 
 ---
 
@@ -302,19 +327,20 @@ Once enabled, the tracker watches for:
 2. **MMSI prefix proximity** — an unknown MMSI sharing the same 3-digit country prefix
    appearing inside the ship's zone
 
-Alerts have a **1-hour cooldown** per MMSI pair to prevent spam.
+Alerts have a **1-hour cooldown** per MMSI pair to prevent spam. Suspects are recorded
+in `suspects.json` and viewable with `/listsuspect`.
 
 When enhanced detection is active for any ship, the AIS subscription broadens to all
-vessels within the tracked bounding boxes (instead of just tracked MMSIs), and also
+vessels within the tracked bounding boxes (instead of just tracked MMSIs) and also
 subscribes to `ShipStaticData` messages.
 
 ---
 
 ## Auto-population of ship details
 
-If a ship entry in `ships.json` has no `name` or no `callsign`, the tracker will
-automatically fill those fields the first time a `ShipStaticData` message arrives for
-that MMSI. A Telegram message confirms what was populated:
+If a ship entry in `ships.json` has no `name` or no `callsign`, the tracker automatically
+fills those fields the first time a `ShipStaticData` message arrives for that MMSI. A
+Telegram message confirms what was populated:
 
 ```
 📋 Ship details auto-populated
@@ -323,8 +349,8 @@ that MMSI. A Telegram message confirms what was populated:
    Callsign: S9F
 ```
 
-Naval prefixes (USS, HMS, HMAS, KRI, etc.) are preserved in uppercase when
-formatting the display name from the raw AIS broadcast.
+Naval prefixes (USS, HMS, HMAS, KRI, etc.) are preserved in uppercase when formatting
+the display name from the raw AIS broadcast.
 
 ---
 
@@ -358,6 +384,15 @@ pm2 restart ship-tracker            # restart after .env changes
 pm2 stop ship-tracker               # stop
 ```
 
+### Reload .env without restarting
+
+Send `SIGHUP` to reload environment variables (including `LLAMA_URL` / `LLAMA_MODEL`)
+without interrupting the WebSocket connection:
+
+```bash
+kill -HUP $(pm2 pid ship-tracker)
+```
+
 ### Survive reboots
 
 ```bash
@@ -387,16 +422,36 @@ pm2 save         # save current process list
 **Step 4 — Invite people**
 Anyone in the group receives alerts.
 
-> ⚠️ **Supergroup gotcha**: If Telegram upgrades your group to a supergroup,
-> the chat ID changes to `-100XXXXXXXXX`. Re-run `getUpdates` to get the new ID
-> and update `.env`, then `pm2 restart ship-tracker`.
+> ⚠️ **Supergroup gotcha**: If Telegram upgrades your group to a supergroup, the chat ID
+> changes to `-100XXXXXXXXX`. Re-run `getUpdates` to get the new ID and update `.env`,
+> then `pm2 restart ship-tracker`.
+
+---
+
+## OpenClaw integration (optional)
+
+The tracker optionally integrates with [OpenClaw](https://openclaw.ai) as an external
+agent layer. OpenClaw's gateway routes messages to Python skill scripts that edit
+`ships.json` and `zones.json` directly; the file-watcher in `tracker.js` picks up
+changes within ~500 ms.
+
+This integration is separate from the native Telegram command handling built into
+`tracker.js` — both can coexist. OpenClaw is primarily useful if you want more
+sophisticated agent reasoning, multi-step confirmation flows, or fuzzy name matching
+beyond what the built-in Llama NL mode provides.
+
+Skill files live in `~/.openclaw/skills/ship-tracker/` and `~/.openclaw/skills/ais/`.
+
+> ⚠️ The skill scripts use hardcoded absolute paths (`~/coding/shipTracking/ships.json`).
+> If you move the repo, update the paths in each script.
 
 ---
 
 ## How it works
 
-1. **Startup** — loads `zones.json` then `ships.json`, builds bounding boxes from all zones,
-   starts the WebSocket connection, starts the HTTP status API on port 3001.
+1. **Startup** — loads `zones.json` then `ships.json`, builds bounding boxes from all
+   zones, starts the WebSocket connection, starts the HTTP status API on port 3001, and
+   begins polling Telegram for commands.
 
 2. **WebSocket subscription** — subscribes to [aisstream.io](https://aisstream.io):
    - Default (no enhanced tracking): filtered to tracked MMSIs, `PositionReport` only.
@@ -415,17 +470,37 @@ Anyone in the group receives alerts.
 
 5. **ShipStaticData from any MMSI** (enhanced mode only):
    - Auto-populates `name` / `callsign` for the matching tracked ship if those fields are empty.
-   - For every *other* tracked ship with enhanced detection, checks if the broadcast
+   - For every other tracked ship with enhanced detection, checks if the broadcast
      name or callsign matches → fires MMSI-change alert if so.
 
-6. **Hot-reload** — `fs.watch` on `ships.json` and `zones.json` triggers a reload + WebSocket
-   reconnect within 500 ms of any file change.
+6. **Hot-reload** — `fs.watch` on `ships.json` and `zones.json` triggers a reload +
+   WebSocket reconnect within 500 ms of any file change.
 
 7. **Reconnection** — exponential backoff (5 s → 60 s max) on WebSocket disconnect.
+   A keepalive ping fires every 30 s to detect silent drops.
 
-8. **Reverse geocoding** — all alert notifications call the Nominatim API to resolve lat/lon
-   to a human-readable place name (sea, bay, city, or country). Timeout is 5 s; failures
-   are silently skipped.
+8. **Reverse geocoding** — all alert notifications call the Nominatim API to resolve
+   lat/lon to a human-readable place name (sea, bay, city, or country). Timeout is 5 s;
+   failures are silently skipped.
 
-9. **Telegram formatting** — outbound alerts use HTML parse mode so coordinates render as
-   tappable Google Maps links.
+9. **Telegram polling** — long-polls `getUpdates` with a 30 s timeout. Slash commands
+   are dispatched directly; plain-English messages in private chats or bot-mention
+   messages in groups are routed to Ollama (if configured).
+
+10. **State persistence** — `state.json` is written every 5 s (throttled) and loaded on
+    startup so positions and zone membership survive restarts.
+
+---
+
+## File reference
+
+| File | Purpose |
+|---|---|
+| `tracker.js` | Main process — AIS WebSocket, Telegram polling, alerts |
+| `ships.json` | List of tracked ships (hot-reloaded) |
+| `zones.json` | Named geo-fence zones (hot-reloaded) |
+| `state.json` | Auto-saved position and zone state (do not edit manually) |
+| `suspects.json` | Auto-saved MMSI-change suspects |
+| `.env` | Secrets and configuration |
+| `ecosystem.config.js` | pm2 process definition |
+| `eslint.config.mjs` | ESLint flat config (dev) |

@@ -10,5 +10,11 @@
     "lat": 1.33,
     "lon": 104.4,
     "radiusKm": 10.0
+  },
+  "Sembawang Naval Base": {
+    "label": "Sembawang Naval Base",
+    "lat": 1.4585,
+    "lon": 103.8185,
+    "radiusKm": 3
   }
 }

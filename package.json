@@ -5,11 +5,17 @@
   "main": "tracker.js",
   "scripts": {
     "start": "node tracker.js",
-    "dev": "node --watch tracker.js"
+    "dev": "node --watch tracker.js",
+    "lint": "eslint ."
   },
   "dependencies": {
     "axios": "^1.7.2",
-    "ws": "^8.17.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.5.0"
   }
 }
