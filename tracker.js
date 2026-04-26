@@ -38,6 +38,21 @@ function tokenize(str) {
   return toks;
 }
 
+// Greedy ship matcher: tries token[0], token[0..1], token[0..2], etc.
+// Returns { ship, rest: string } or { ship: null, rest: '' }
+function splitShipArgs(args) {
+  const toks = tokenize(args);
+  let matched = null;
+  let matchLen = 0;
+  for (let i = 1; i <= toks.length; i++) {
+    const candidate = toks.slice(0, i).join(' ');
+    const found = shipsModule.findShip(candidate);
+    if (found) { matched = found; matchLen = i; }
+  }
+  const rest = toks.slice(matchLen).join(' ');
+  return { ship: matched, rest };
+}
+
 // ── Telegram update router ───────────────────────────────────────────
 
 async function handleTelegramUpdate(update) {
@@ -347,14 +362,14 @@ async function cmdSetCallsign(chatId, args) {
     return await sendTelegram(chatId, 'Usage: /setcallsign <name or mmsi> <callsign>\nUse "none" to clear.');
   }
 
-  const tokens          = tokenize(args);
-  const ship            = shipsModule.findShip(tokens[0]);
-  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${tokens[0]}".`);
+  const { ship, rest: callsignRaw } = splitShipArgs(args);
+  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
+  if (!callsignRaw)  return await sendTelegram(chatId, 'Usage: /setcallsign <name or mmsi> <callsign>\nUse "none" to clear.');
 
   shipsModule.takeShipsBackup();
 
   const label           = ship.name || `MMSI ${ship.mmsi}`;
-  const callsign        = tokens.slice(1).join(' ').toUpperCase();
+  const callsign        = callsignRaw.toUpperCase();
 
   if (callsign === 'NONE') {
     delete ship.callsign;
@@ -370,17 +385,13 @@ async function cmdSetCallsign(chatId, args) {
 async function cmdAddAltName(chatId, args) {
   if (!args) return await sendTelegram(chatId, 'Usage: /addaltname <name or mmsi> <alternate name>');
 
-  const tokens          = tokenize(args);
-  if (tokens.length < 2) {
-    return await sendTelegram(chatId, 'Provide both ship and alternate name.');
-  }
-
-  const ship            = shipsModule.findShip(tokens[0]);
-  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${tokens[0]}".`);
+  const { ship, rest: altNameRaw } = splitShipArgs(args);
+  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
+  if (!altNameRaw)   return await sendTelegram(chatId, 'Provide both ship and alternate name.');
 
   shipsModule.takeShipsBackup();
 
-  const altName         = tokens.slice(1).join(' ').toUpperCase();
+  const altName         = altNameRaw.toUpperCase();
   if (!ship.altNames)    ship.altNames   = [];
   if (ship.altNames.map(n => n.toUpperCase()).includes(altName)) {
     return await sendTelegram(chatId, `"${altName}" is already in the alt names list for ${ship.name || ship.mmsi}.`);
@@ -396,17 +407,13 @@ async function cmdAddAltName(chatId, args) {
 async function cmdRmAltName(chatId, args) {
   if (!args) return await sendTelegram(chatId, 'Usage: /rmaltname <name or mmsi> <alternate name>');
 
-  const tokens          = tokenize(args);
-  if (tokens.length < 2) {
-    return await sendTelegram(chatId, 'Provide both ship and alternate name to remove.');
-  }
-
-  const ship            = shipsModule.findShip(tokens[0]);
-  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${tokens[0]}".`);
+  const { ship, rest: altNameRaw } = splitShipArgs(args);
+  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
+  if (!altNameRaw)   return await sendTelegram(chatId, 'Provide both ship and alternate name to remove.');
 
   shipsModule.takeShipsBackup();
 
-  const altName         = tokens.slice(1).join(' ').toUpperCase();
+  const altName         = altNameRaw.toUpperCase();
   const before          = (ship.altNames || []).length;
   ship.altNames         = (ship.altNames || []).filter(n => n.toUpperCase() !== altName);
 
@@ -428,19 +435,15 @@ async function cmdAddZone(chatId, args) {
         '   /addzone <ship> <lat,lon,radiusKm>');
   }
 
-  const tokens          = tokenize(args);
-  if (tokens.length < 2) {
-    return await sendTelegram(chatId, 'Provide at least a ship and a zone. Use /help for syntax.');
-  }
-
-  const shipQuery       = tokens[0];
-  const ship            = shipsModule.findShip(shipQuery);
-  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${shipQuery}".`);
+  const { ship, rest: zoneRaw } = splitShipArgs(args);
+  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
+  if (!zoneRaw)      return await sendTelegram(chatId, 'Provide at least a ship and a zone. Use /help for syntax.');
 
   shipsModule.takeShipsBackup();
 
-  const zoneArg         = tokens[1];
-  const radiusArg       = tokens[2] ? parseFloat(tokens[2]) : null;
+  const zoneTokens      = tokenize(zoneRaw);
+  const zoneArg         = zoneTokens[0];
+  const radiusArg       = zoneTokens[1] ? parseFloat(zoneTokens[1]) : null;
   let zone;
 
     // Try inline lat,lon,radius format
@@ -479,17 +482,11 @@ async function cmdAddZone(chatId, args) {
 async function cmdRmZone(chatId, args) {
   if (!args) return await sendTelegram(chatId, 'Usage: /rmzone <ship> <zone name>');
 
-  const tokens          = tokenize(args);
-  if (tokens.length < 2) {
-    return await sendTelegram(chatId, 'Provide both ship and zone name. Use /help for syntax.');
-  }
-
-  const ship            = shipsModule.findShip(tokens[0]);
-  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${tokens[0]}".`);
+  const { ship, rest: zoneLabel } = splitShipArgs(args);
+  if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
+  if (!zoneLabel)    return await sendTelegram(chatId, 'Provide both ship and zone name. Use /help for syntax.');
 
   shipsModule.takeShipsBackup();
-
-  const zoneLabel       = tokens.slice(1).join(' ');
   const before          = (ship.zones || []).length;
   ship.zones            = (ship.zones || []).filter(
      z => z.label.toLowerCase() !== zoneLabel.toLowerCase());
