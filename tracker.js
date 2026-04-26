@@ -53,6 +53,21 @@ function splitShipArgs(args) {
   return { ship: matched, rest };
 }
 
+// Greedy zone matcher over remaining tokens after ship is resolved.
+// Returns { zone, rest: string } or { zone: null, rest: '' }
+function splitZoneArgs(args) {
+  const toks = tokenize(args);
+  let matched = null;
+  let matchLen = 0;
+  for (let i = 1; i <= toks.length; i++) {
+    const candidate = toks.slice(0, i).join(' ');
+    const found = zonesMod.resolveZoneLabel(candidate);
+    if (found) { matched = found; matchLen = i; }
+  }
+  const rest = toks.slice(matchLen).join(' ');
+  return { zone: matched, rest };
+}
+
 // ── Telegram update router ───────────────────────────────────────────
 
 async function handleTelegramUpdate(update) {
@@ -441,24 +456,23 @@ async function cmdAddZone(chatId, args) {
 
   shipsModule.takeShipsBackup();
 
-  const zoneTokens      = tokenize(zoneRaw);
-  const zoneArg         = zoneTokens[0];
-  const radiusArg       = zoneTokens[1] ? parseFloat(zoneTokens[1]) : null;
+  const firstToken      = tokenize(zoneRaw)[0] || '';
+  const coordMatch      = firstToken.match(/^(-?\d+\.?\d*),(-?\d+\.?\d*),(\d+\.?\d*)$/);
   let zone;
 
     // Try inline lat,lon,radius format
-  const coordMatch      = zoneArg.match(/^(-?\d+\.?\d*),(-?\d+\.?\d*),(\d+\.?\d*)$/);
   if (coordMatch) {
-    zone                = { label: zoneArg, lat: +coordMatch[1], lon: +coordMatch[2], radiusKm: +coordMatch[3] };
+    zone                = { label: firstToken, lat: +coordMatch[1], lon: +coordMatch[2], radiusKm: +coordMatch[3] };
   } else {
-       // Named zone from zones.json
-    const named           = zonesMod.resolveZoneLabel(zoneArg);
+       // Named zone — greedy match, remainder is optional radius override
+    const { zone: named, rest: radiusRaw } = splitZoneArgs(zoneRaw);
     if (!named) {
       return await sendTelegram(chatId,
-          `Zone "${zoneArg}" not found in named zones.\n` +
+          `Zone "${zoneRaw}" not found in named zones.\n` +
           `Use /listzones to see available zones, or provide lat,lon,radiusKm directly.`);
     }
     zone                = { ...named };
+    const radiusArg     = radiusRaw ? parseFloat(radiusRaw) : null;
     if (radiusArg && !isNaN(radiusArg)) zone.radiusKm = radiusArg;
   }
 
@@ -482,11 +496,12 @@ async function cmdAddZone(chatId, args) {
 async function cmdRmZone(chatId, args) {
   if (!args) return await sendTelegram(chatId, 'Usage: /rmzone <ship> <zone name>');
 
-  const { ship, rest: zoneLabel } = splitShipArgs(args);
+  const { ship, rest: zoneRaw } = splitShipArgs(args);
   if (!ship)         return await sendTelegram(chatId, `No ship found matching "${args}".`);
-  if (!zoneLabel)    return await sendTelegram(chatId, 'Provide both ship and zone name. Use /help for syntax.');
+  if (!zoneRaw)      return await sendTelegram(chatId, 'Provide both ship and zone name. Use /help for syntax.');
 
   shipsModule.takeShipsBackup();
+  const zoneLabel       = zoneRaw.trim();
   const before          = (ship.zones || []).length;
   ship.zones            = (ship.zones || []).filter(
      z => z.label.toLowerCase() !== zoneLabel.toLowerCase());
