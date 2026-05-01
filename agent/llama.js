@@ -2,8 +2,9 @@ const axios = require('axios');
 
 /** Translate a natural-language query into an array of { command, args } objects. */
 async function translateIntent(nlQuery) {
-  const LLAMA_URL     = process.env.LLAMA_URL;
-  const LLAMA_MODEL   = process.env.LLAMA_MODEL || 'llama-model';
+  const config        = require('../config');
+  const LLAMA_URL     = config.LLAMA_URL;
+  const LLAMA_MODEL   = config.LLAMA_MODEL;
   if (!LLAMA_URL) return null;
 
   const ships     = require('../data/ships');

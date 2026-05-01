@@ -7,9 +7,10 @@ async function sendTelegram(chatId, text, parseMode) {
   const target = chatId || TG_CHAT_ID;
   if (!target) return;
   try {
-    const body = { chat_id: target, text };
+    const body = { chat_id: target, text: Array.isArray(text) ? text.join('\n') : text };
     if (parseMode) body.parse_mode = parseMode;
-    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, body);
+    const res = await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, body);
+    console.log(`[sendTelegram] ok → chat ${target} (${res.data?.ok})`);
   } catch (err) {
     console.error('[sendTelegram] error:', err?.response?.data || err.message);
   }
