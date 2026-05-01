@@ -8,8 +8,8 @@ const ZONES_FILE         = path.join(__dirname, 'zones.json');
 const STATE_FILE         = path.join(__dirname, 'state.json');
 const SUSPECTS_FILE      = path.join(__dirname, 'suspects.json');
 
-const LLAMA_URL          = process.env.LLAMA_URL; // e.g. http://127.0.0.1:11435
-const LLAMA_MODEL        = process.env.LLAMA_MODEL || 'llama3';
+const LLAMA_URL          = process.env.LLAMA_URL   || 'http://192.168.100.140:8081';
+const LLAMA_MODEL        = process.env.LLAMA_MODEL || 'Qwen3-8B-Q4_K_M.gguf';
 
 // ── Constants ───────────────────────────────────────────────────────
 
