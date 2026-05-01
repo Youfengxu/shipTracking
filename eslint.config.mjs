@@ -3,19 +3,22 @@ import globals from "globals";
 
 export default [
   js.configs.recommended,
-  {
+   {
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
       globals: {
-        ...globals.node,
-        ...globals.es2021,
+         ...globals.node,
+         ...globals.es2021,
+       },
+        },
+     rules: {
+        "no-unused-vars": ["warn", {
+           argsIgnorePattern: "^_",
+           varsIgnorePattern: "^_",
+         }],
+        "no-constant-condition": "warn",
+        "no-empty": "warn",
       },
     },
-    rules: {
-      "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
-      "no-constant-condition": "warn",
-      "no-empty": "warn",
-    },
-  },
 ];

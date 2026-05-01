@@ -2,3 +2,4 @@ node_modules/
 .env
 ships.json
 logs/
+ecosystem.local.config.js

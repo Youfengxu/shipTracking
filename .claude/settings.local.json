@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -i '' '616s/const httpServer /=/' /Users/youfeng/coding/shipTracker/tracker.js)",
+      "Bash(sed -n '616p' /Users/youfeng/coding/shipTracker/tracker.js)"
+    ]
+  }
+}
