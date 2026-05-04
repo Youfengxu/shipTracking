@@ -701,3 +701,64 @@ process.on('SIGHUP', () => {
   require('dotenv').config({ override: true });
   log(`[config] Reloaded .env — LLAMA_MODEL is now "${config.LLAMA_MODEL}"`);
 });
+
+// ── Shutdown alerts ──────────────────────────────────────────────────
+
+let _shutdownAlertSent = false;
+
+async function sendShutdownAlert(reason) {
+  if (_shutdownAlertSent) return;
+  _shutdownAlertSent = true;
+  try {
+    await Promise.race([
+      sendTelegram(null, `🔴 Ship tracker going offline\nReason: ${reason}\n🕐 ${new Date().toUTCString()}`),
+      new Promise(r => setTimeout(r, 4000)),
+    ]);
+  } catch (_) {}
+}
+
+process.on('SIGTERM', async () => {
+  await sendShutdownAlert('SIGTERM (pm2 stop/restart)');
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  await sendShutdownAlert('SIGINT');
+  process.exit(0);
+});
+
+process.on('uncaughtException', async (err) => {
+  log(`Uncaught exception: ${err.stack || err.message}`);
+  await sendShutdownAlert(`Crash: ${err.message}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason) => {
+  log(`Unhandled rejection: ${reason}`);
+  await sendShutdownAlert(`Unhandled rejection: ${reason}`);
+  process.exit(1);
+});
+
+// ── LLM health monitor ───────────────────────────────────────────────
+
+const LLM_CHECK_INTERVAL  = 5 * 60 * 1000; // 5 min
+let _llamaUp              = true;
+
+async function checkLlamaHealth() {
+  try {
+    await axios.get(`${config.LLAMA_URL}/health`, { timeout: 5000 });
+    if (!_llamaUp) {
+      _llamaUp = true;
+      log('LLM back online');
+      await sendTelegram(null, `✅ LLM back online\n🕐 ${new Date().toUTCString()}`);
+    }
+  } catch (_) {
+    if (_llamaUp) {
+      _llamaUp = false;
+      log('LLM health check failed');
+      await sendTelegram(null, `⚠️ LLM offline — NL commands disabled\n🔗 ${config.LLAMA_URL}\n🕐 ${new Date().toUTCString()}`);
+    }
+  }
+}
+
+setInterval(checkLlamaHealth, LLM_CHECK_INTERVAL);
