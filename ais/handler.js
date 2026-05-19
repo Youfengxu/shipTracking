@@ -90,7 +90,7 @@ function scheduleAisCheck(mmsi) {
     if (!ship) return;
     const label = ship.name || `MMSI ${mmsi}`;
     const mins   = Math.round(require('../config').AIS_CHECK_WINDOW / 60000);
-    await sendTelegram(
+    await sendTelegram(null,
         `⚠️ NO AIS SIGNAL DETECTED\n` +
         `🚢 ${label} (MMSI ${mmsi})\n` +
         `📵 No position report received in the last ${mins} minutes.\n` +
@@ -155,7 +155,7 @@ async function handleAisMessage(raw) {
           const lines = [`📋 Ship details auto-populated`, `🚢 MMSI ${mmsi}`];
           if (ship.name)     lines.push(`   Name: ${ship.name}`);
           if (ship.callsign) lines.push(`   Callsign: ${ship.callsign}`);
-          await sendTelegram(lines.join('\n'));
+          await sendTelegram(null, lines.join('\n'));
          }
        }
 
