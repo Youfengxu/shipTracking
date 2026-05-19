@@ -54,6 +54,7 @@ function _getBoundingBoxes() {
 
 module.exports = {
   get SHIPS() { return SHIPS; },
+  get SHIP_MAP() { return SHIP_MAP; },
   takeShipsBackup,
   loadShips,
   saveShips,
