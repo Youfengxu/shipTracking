@@ -46,7 +46,7 @@ function start(shipsConfig) {
   ws.on('close', (code, _reason) => {
     log(`Disconnected (${code}). Reconnecting in ${reconnectDelay / 1000}s...`);
     clearInterval(ws._pingInterval);
-    setTimeout(start, reconnectDelay);
+    setTimeout(() => start(shipsConfig), reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 60000);
    });
 
