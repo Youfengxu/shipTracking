@@ -3,6 +3,14 @@ const path       = require('path');
 const AISSTREAM_KEY      = process.env.AISSTREAM_KEY;
 const TG_TOKEN           = process.env.TG_TOKEN;
 const TG_CHAT_ID         = process.env.TG_CHAT_ID;
+// Allowlist of chat IDs permitted to command the bot. Defaults to TG_CHAT_ID
+// (the supergroup — covers every member). Add extra chats (e.g. your private
+// DM) via TG_ALLOWED_CHATS=comma,separated,ids
+const ALLOWED_CHATS      = new Set(
+  [TG_CHAT_ID, ...String(process.env.TG_ALLOWED_CHATS || '').split(',')]
+    .map(x => String(x || '').trim())
+    .filter(Boolean)
+);
 const SHIPS_FILE         = path.join(__dirname, 'ships.json');
 const ZONES_FILE         = path.join(__dirname, 'zones.json');
 const STATE_FILE         = path.join(__dirname, 'state.json');
@@ -27,7 +35,7 @@ const NAVAL_PREFIXES     = new Set([
 ]);
 
 module.exports = {
-  AISSTREAM_KEY, TG_TOKEN, TG_CHAT_ID,
+  AISSTREAM_KEY, TG_TOKEN, TG_CHAT_ID, ALLOWED_CHATS,
   SHIPS_FILE, ZONES_FILE, STATE_FILE, SUSPECTS_FILE,
   LLAMA_URL, LLAMA_MODEL,
   AIS_CHECK_WINDOW, STARTUP_GRACE_MS, STALE_MS,

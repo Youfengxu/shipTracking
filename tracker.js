@@ -78,6 +78,12 @@ async function handleTelegramUpdate(update) {
   const chatId    = msg.chat.id;
   const isPrivate = msg.chat.type === 'private';
 
+  // ── Authorization: only the supergroup (and any TG_ALLOWED_CHATS) may command the bot ──
+  if (config.ALLOWED_CHATS.size && !config.ALLOWED_CHATS.has(String(chatId))) {
+    log(`[tg] ignored message from unauthorized chat ${chatId} (${msg.chat.type})`);
+    return;
+  }
+
   if (!text) return;
 
     // Path A: Direct Slash Command — bypass LLM
@@ -600,6 +606,7 @@ async function pollTelegram() {
     const me            = await axios.get(`https://api.telegram.org/bot${config.TG_TOKEN}/getMe`, { timeout: 10000 });
     BOT_USERNAME        = (me.data.result.username || '').toLowerCase();
     log(`Telegram bot @${BOT_USERNAME} — polling for commands`);
+    log(`[tg] authorized chats: ${[...config.ALLOWED_CHATS].join(", ") || "(none — open!)"}`);
   } catch (err) {
     log(`Failed to fetch bot info: ${err.message}`);
   }
